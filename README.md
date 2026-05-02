@@ -1,29 +1,39 @@
-# Claude Code Usage Dashboard
+# Claude Usage Dashboard
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
 [![claude-code](https://img.shields.io/badge/claude--code-black?style=flat-square)](https://claude.ai/code)
 
 **Pro and Max subscribers get a progress bar. This gives you the full picture.**
 
-Claude Code writes detailed usage logs locally — token counts, models, sessions, projects — regardless of your plan. This dashboard reads those logs and turns them into charts and cost estimates. Works on API, Pro, and Max plans.
+Claude writes detailed usage logs locally — token counts, models, sessions, projects — regardless of your plan. This dashboard reads those logs and turns them into charts and cost estimates. Works on API, Pro, and Max plans.
+
+> **This is a fork of [phuryn/claude-usage](https://github.com/phuryn/claude-usage) with UI and usability improvements.**  
+> Big thanks to [@phuryn](https://github.com/phuryn) and [The Product Compass Newsletter](https://www.productcompass.pm) for the original work. 🙌
 
 ![Claude Usage Dashboard](docs/screenshot.png)
 
-**Created by:** [The Product Compass Newsletter](https://www.productcompass.pm)
+---
+
+## What's new in this fork
+
+- **Compact model filter** — replaced flat pill buttons (which overflow on wide model lists) with a single dropdown multi-select. Shows "All Models" by default; displays `N / M models` when filtered.
+- **Custom favicon** — clean icon so the browser tab is easy to spot.
+- **macOS auto-start** — included LaunchAgent plist instructions so the dashboard starts automatically on login.
+- **`week` command** — `python3 cli.py week` prints a 7-day summary (per-day + by-model) in the terminal.
 
 ---
 
 ## What this tracks
 
-Works on **API, Pro, and Max plans** — Claude Code writes local usage logs regardless of subscription type. This tool reads those logs and gives you visibility that Anthropic's UI doesn't provide.
+Works on **API, Pro, and Max plans** — Claude writes local usage logs regardless of subscription type. This tool reads those logs and gives you visibility that Anthropic's UI doesn't provide.
 
 Captures usage from:
 - **Claude Code CLI** (`claude` command in terminal)
 - **VS Code extension** (Claude Code sidebar)
 - **Dispatched Code sessions** (sessions routed through Claude Code)
+- **Claude.ai Cowork sessions** — captured from `~/Library/Application Support/Claude/local-agent-mode-sessions/` which the Claude desktop app writes locally
 
-**Not captured:**
-- **Cowork sessions** — these run server-side and do not write local JSONL transcripts
+Usage is broken down **project by project**, so you can see which codebases or workflows consume the most tokens.
 
 ---
 
@@ -40,14 +50,14 @@ No `pip install`, no virtual environment, no build step.
 
 ### Windows
 ```
-git clone https://github.com/phuryn/claude-usage
+git clone https://github.com/aeozturkmen/claude-usage
 cd claude-usage
 python cli.py dashboard
 ```
 
 ### macOS / Linux
 ```
-git clone https://github.com/phuryn/claude-usage
+git clone https://github.com/aeozturkmen/claude-usage
 cd claude-usage
 python3 cli.py dashboard
 ```
@@ -119,10 +129,58 @@ Costs are calculated using **Anthropic API pricing as of April 2026** ([claude.c
 
 ---
 
+## macOS — Auto-start on login
+
+Create `~/Library/LaunchAgents/com.claudeusage.dashboard.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.claudeusage.dashboard</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/path/to/claude-usage/cli.py</string>
+        <string>dashboard</string>
+        <string>--port</string>
+        <string>8080</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/path/to/claude-usage</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/YOUR_USERNAME/Library/Logs/claudeusage-dashboard.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOUR_USERNAME/Library/Logs/claudeusage-dashboard.err</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/YOUR_USERNAME</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>
+```
+
+Replace `/path/to/claude-usage` and `YOUR_USERNAME` with your actual values, then load it:
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.claudeusage.dashboard.plist
+```
+
+---
+
 ## Files
 
 | File | Purpose |
 |------|---------|
 | `scanner.py` | Parses JSONL transcripts, writes to `~/.claude/usage.db` |
 | `dashboard.py` | HTTP server + single-page HTML/JS dashboard |
-| `cli.py` | `scan`, `today`, `stats`, `dashboard` commands |
+| `cli.py` | `scan`, `today`, `week`, `stats`, `dashboard` commands |

@@ -1,5 +1,5 @@
 """
-dashboard.py - Local web dashboard served on localhost:8080.
+dashboard.py - Local web dashboard served on localhost (default port 8080).
 """
 
 import json
@@ -31,21 +31,24 @@ def get_dashboard_data(db_path=DB_PATH):
     # ── Daily per-model, ALL history (client filters by range) ────────────────
     daily_rows = conn.execute("""
         SELECT
-            substr(timestamp, 1, 10)   as day,
-            COALESCE(model, 'unknown') as model,
-            SUM(input_tokens)          as input,
-            SUM(output_tokens)         as output,
-            SUM(cache_read_tokens)     as cache_read,
-            SUM(cache_creation_tokens) as cache_creation,
-            COUNT(*)                   as turns
-        FROM turns
-        GROUP BY day, model
-        ORDER BY day, model
+            substr(t.timestamp, 1, 10)   as day,
+            COALESCE(t.model, 'unknown') as model,
+            CASE WHEN s.project_name = 'cowork' THEN 'cowork' ELSE 'code' END as source,
+            SUM(t.input_tokens)          as input,
+            SUM(t.output_tokens)         as output,
+            SUM(t.cache_read_tokens)     as cache_read,
+            SUM(t.cache_creation_tokens) as cache_creation,
+            COUNT(*)                     as turns
+        FROM turns t
+        LEFT JOIN sessions s ON t.session_id = s.session_id
+        GROUP BY day, t.model, source
+        ORDER BY day, t.model
     """).fetchall()
 
     daily_by_model = [{
         "day":            r["day"],
         "model":          r["model"],
+        "source":         r["source"],
         "input":          r["input"] or 0,
         "output":         r["output"] or 0,
         "cache_read":     r["cache_read"] or 0,
@@ -57,21 +60,24 @@ def get_dashboard_data(db_path=DB_PATH):
     # Timestamps are ISO8601 UTC (e.g. "2026-04-08T09:30:00Z"); chars 12-13 = hour.
     hourly_rows = conn.execute("""
         SELECT
-            substr(timestamp, 1, 10)                  as day,
-            CAST(substr(timestamp, 12, 2) AS INTEGER) as hour,
-            COALESCE(model, 'unknown')                as model,
-            SUM(output_tokens)                        as output,
-            COUNT(*)                                  as turns
-        FROM turns
-        WHERE timestamp IS NOT NULL AND length(timestamp) >= 13
-        GROUP BY day, hour, model
-        ORDER BY day, hour, model
+            substr(t.timestamp, 1, 10)                  as day,
+            CAST(substr(t.timestamp, 12, 2) AS INTEGER) as hour,
+            COALESCE(t.model, 'unknown')                as model,
+            CASE WHEN s.project_name = 'cowork' THEN 'cowork' ELSE 'code' END as source,
+            SUM(t.output_tokens)                        as output,
+            COUNT(*)                                    as turns
+        FROM turns t
+        LEFT JOIN sessions s ON t.session_id = s.session_id
+        WHERE t.timestamp IS NOT NULL AND length(t.timestamp) >= 13
+        GROUP BY day, hour, t.model, source
+        ORDER BY day, hour, t.model
     """).fetchall()
 
     hourly_by_model = [{
         "day":    r["day"],
         "hour":   r["hour"] if r["hour"] is not None else 0,
         "model":  r["model"],
+        "source": r["source"],
         "output": r["output"] or 0,
         "turns":  r["turns"] or 0,
     } for r in hourly_rows]
@@ -98,6 +104,7 @@ def get_dashboard_data(db_path=DB_PATH):
         sessions_all.append({
             "session_id":    r["session_id"][:8],
             "project":       r["project_name"] or "unknown",
+            "source":        "cowork" if r["project_name"] == "cowork" else "code",
             "branch":        r["git_branch"] or "",
             "last":          (r["last_timestamp"] or "")[:16].replace("T", " "),
             "last_date":     (r["last_timestamp"] or "")[:10],
@@ -127,6 +134,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Claude Code Usage Dashboard</title>
+<link rel="icon" type="image/x-icon" href="data:image/x-icon;base64,AAABAAIAEBAAAAAAIADYAgAAJgAAACAgAAAAACAA7gAAAP4CAACJUE5HDQoaCgAAAA1JSERSAAAAEAAAABAIBgAAAB/z/2EAAAKfSURBVHicdZNNSFRRFMf/59734RvfjGNaVCAVFklZEAlBBRbtmmhRPMQWLlq4EIoyhGjzFCKIyhYVgZs2ReBg2MJ1StFKV4kZllAYFqaNOjrzvu5pMc40ah24HO659/wP95zfJWwwdl1BPT2quJ++1crVlolQMajsngIjk/PWxUrJbzqa7V3JnSdY4WSgolAXQoRqTZNBIDABliK6WhIYbW/Xm/r6gg+dF88lrIpnoVK1hhSou/1iXZFym+xqyVB55YkbTipmaoMAaTFDw0LO+xbz7SNLiaWssbBM/pY4F31N1kwuSn+K+h1HOg4wNaad1SVeCUGaF0S+Ir4DXz5p6H3561/V57oux+cpO0MAqN/pF4f3DGQsQ9rMWPbCoHX/3fQQAHzsOh+X+XjpGdLzKTINljE/GTKNawC4sX7gTIWUskITan7Fu3/gXnpotP2onjAbLCXCCWGH8ZDBYCYVIwABGIKYYAsAEBFOJS3TyqwGi1oeT9l1RVPfWLDW9mopREISVWlCJIpLCooTQBoAgJADMyLmSP3AIh718N/ZIhdFrEXMTGUoMDERSC8ICPi+UmGlqVXmd0fHCHjLLsT0rE9aXKtJWsYmkJiBTH4NpMnO1lrS1axt6nLVD9/t/RKdpnQ6Gu9wbD1BVySEUQSJmImJmACLgWvErisAiE/5ycGqCiMVRgq5IBjyfW5rfJhe+B9EJZAYoG7Xpe6JCfpcL17HTSOV9QIw81wEPK5eVr1zW+EXkzaBVOhTQQTDw6Lt+PbBmpiV8iOF1SCAmZf2jgfPVzZW/+k69u8cfdcKQwAzQDQyEh7c5lxo2udfZ1bNzHzIU2Hy681LBnkBsalz0efCIEkArf+NhUBphDOdLXVZg99roEQRpOIZEYhB9h/Ej0jLW66dIQAAAABJRU5ErkJggolQTkcNChoKAAAADUlIRFIAAAAgAAAAIAgGAAAAc3p69AAAALVJREFUeJztl9ENgCAMRItxF0dyFGdwFEdyGv0yMRHKhfaqJN4/3IMeFJIYtS/zYRk/WAGseh0gtQy6b/u0bqY5xhZTT0ElYJlDAEzzKgDbXETJQM28NXwQgGbuZXzpUYJI8yxApLkIeA9o5q69ICL1KkBOrK2HAdj6Ab4PENqM2InP6WFYWrE33OUDZyDsRcS8diEABMITpFiCWs29QNQMRJyKPpoREwL+mNwhPENoXln3v+MTGzVS0QiHd/wAAAAASUVORK5CYII=">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
   :root {
@@ -142,23 +150,37 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px; }
 
-  header { background: var(--card); border-bottom: 1px solid var(--border); padding: 16px 24px; display: flex; align-items: center; justify-content: space-between; }
-  header h1 { font-size: 18px; font-weight: 600; color: var(--accent); }
+  header { background: var(--card); border-bottom: 1px solid var(--border); padding: 16px 24px; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+  header h1 { font-size: 18px; font-weight: 600; color: var(--accent); flex-shrink: 0; }
   header .meta { color: var(--muted); font-size: 12px; }
-  #rescan-btn { background: var(--card); border: 1px solid var(--border); color: var(--muted); padding: 4px 12px; border-radius: 6px; cursor: pointer; font-size: 12px; margin-top: 4px; }
+  .header-right { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+  #rescan-btn { background: var(--card); border: 1px solid var(--border); color: var(--muted); padding: 4px 12px; border-radius: 6px; cursor: pointer; font-size: 12px; }
   #rescan-btn:hover { color: var(--text); border-color: var(--accent); }
   #rescan-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
   #filter-bar { background: var(--card); border-bottom: 1px solid var(--border); padding: 10px 24px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .filter-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); white-space: nowrap; }
   .filter-sep { width: 1px; height: 22px; background: var(--border); flex-shrink: 0; }
-  #model-checkboxes { display: flex; flex-wrap: wrap; gap: 6px; }
-  .model-cb-label { display: flex; align-items: center; gap: 5px; padding: 3px 10px; border-radius: 20px; border: 1px solid var(--border); cursor: pointer; font-size: 12px; color: var(--muted); transition: border-color 0.15s, color 0.15s, background 0.15s; user-select: none; }
-  .model-cb-label:hover { border-color: var(--accent); color: var(--text); }
-  .model-cb-label.checked { background: rgba(217,119,87,0.12); border-color: var(--accent); color: var(--text); }
+  /* ── Model dropdown ── */
+  .model-dropdown { position: relative; flex-shrink: 0; }
+  .model-dropdown-btn { display: flex; align-items: center; gap: 6px; padding: 4px 10px 4px 12px; border: 1px solid var(--border); border-radius: 6px; background: transparent; color: var(--muted); font-size: 12px; cursor: pointer; white-space: nowrap; transition: border-color 0.15s, color 0.15s; }
+  .model-dropdown-btn:hover, .model-dropdown-btn.open { border-color: var(--accent); color: var(--text); }
+  .model-dropdown-btn.has-selection { border-color: var(--accent); color: var(--accent); background: rgba(217,119,87,0.1); }
+  .model-dropdown-btn .chevron { font-size: 9px; opacity: 0.7; transition: transform 0.15s; }
+  .model-dropdown-btn.open .chevron { transform: rotate(180deg); }
+  .model-dropdown-panel { display: none; position: absolute; top: calc(100% + 6px); left: 0; z-index: 100; background: #1e1e2e; border: 1px solid var(--border); border-radius: 8px; min-width: 220px; max-height: 320px; overflow-y: auto; box-shadow: 0 8px 24px rgba(0,0,0,0.5); padding: 6px 0; }
+  .model-dropdown-panel.open { display: block; }
+  .model-dd-actions { display: flex; gap: 0; border-bottom: 1px solid var(--border); padding: 4px 8px 8px; }
+  .model-dd-action { flex: 1; padding: 3px 0; background: transparent; border: 1px solid var(--border); color: var(--muted); font-size: 11px; cursor: pointer; transition: color 0.15s; }
+  .model-dd-action:first-child { border-radius: 4px 0 0 4px; }
+  .model-dd-action:last-child  { border-radius: 0 4px 4px 0; border-left: none; }
+  .model-dd-action:hover { color: var(--text); }
+  .model-cb-label { display: flex; align-items: center; gap: 8px; padding: 6px 14px; cursor: pointer; font-size: 12px; color: var(--muted); transition: background 0.1s, color 0.1s; user-select: none; white-space: nowrap; }
+  .model-cb-label:hover { background: rgba(255,255,255,0.04); color: var(--text); }
+  .model-cb-label.checked { color: var(--text); }
   .model-cb-label input { display: none; }
-  .filter-btn { padding: 3px 10px; border-radius: 4px; border: 1px solid var(--border); background: transparent; color: var(--muted); font-size: 11px; cursor: pointer; white-space: nowrap; }
-  .filter-btn:hover { border-color: var(--accent); color: var(--text); }
+  .model-cb-check { width: 13px; height: 13px; border: 1px solid var(--border); border-radius: 3px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: 9px; transition: background 0.1s, border-color 0.1s; }
+  .model-cb-label.checked .model-cb-check { background: var(--accent); border-color: var(--accent); color: #fff; }
   .range-group { display: flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; flex-shrink: 0; }
   .range-btn { padding: 4px 13px; background: transparent; border: none; border-right: 1px solid var(--border); color: var(--muted); font-size: 12px; cursor: pointer; transition: background 0.15s, color 0.15s; }
   .range-btn:last-child { border-right: none; }
@@ -224,14 +246,33 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <header>
   <h1>Claude Code Usage Dashboard</h1>
   <div class="meta" id="meta">Loading...</div>
-  <button id="rescan-btn" onclick="triggerRescan()" title="Rebuild the database from scratch by re-scanning all JSONL files. Use if data looks stale or costs seem wrong.">&#x21bb; Rescan</button>
+  <div class="header-right">
+    <button id="rescan-btn" onclick="triggerRescan()" title="Rebuild the database from scratch by re-scanning all JSONL files. Use if data looks stale or costs seem wrong.">&#x21bb; Rescan</button>
+  </div>
 </header>
 
 <div id="filter-bar">
   <div class="filter-label">Models</div>
-  <div id="model-checkboxes"></div>
-  <button class="filter-btn" onclick="selectAllModels()">All</button>
-  <button class="filter-btn" onclick="clearAllModels()">None</button>
+  <div class="model-dropdown" id="model-dropdown">
+    <button class="model-dropdown-btn" id="model-dropdown-btn" onclick="toggleModelDropdown(event)">
+      <span id="model-dropdown-label">All Models</span>
+      <span class="chevron">▼</span>
+    </button>
+    <div class="model-dropdown-panel" id="model-dropdown-panel">
+      <div class="model-dd-actions">
+        <button class="model-dd-action" onclick="selectAllModels()">All</button>
+        <button class="model-dd-action" onclick="clearAllModels()">None</button>
+      </div>
+      <div id="model-checkboxes"></div>
+    </div>
+  </div>
+  <div class="filter-sep"></div>
+  <div class="filter-label">Source</div>
+  <div class="range-group">
+    <button class="range-btn source-btn active" data-source="all"    onclick="setSource('all')">All</button>
+    <button class="range-btn source-btn"         data-source="code"   onclick="setSource('code')">Code</button>
+    <button class="range-btn source-btn"         data-source="cowork" onclick="setSource('cowork')">Cowork</button>
+  </div>
   <div class="filter-sep"></div>
   <div class="filter-label">Range</div>
   <div class="range-group">
@@ -363,6 +404,7 @@ function esc(s) {
 let rawData = null;
 let selectedModels = new Set();
 let selectedRange = '30d';
+let selectedSource = 'all';  // 'all' | 'code' | 'cowork'
 let charts = {};
 let sessionSortCol = 'last';
 let modelSortCol = 'cost';
@@ -526,14 +568,28 @@ function readURLRange() {
   return VALID_RANGES.includes(p) ? p : '30d';
 }
 
+function readURLSource() {
+  const p = new URLSearchParams(window.location.search).get('source');
+  return ['all', 'code', 'cowork'].includes(p) ? p : 'all';
+}
+
 function setRange(range) {
   selectedRange = range;
-  document.querySelectorAll('.range-btn').forEach(btn =>
+  document.querySelectorAll('.range-btn:not(.source-btn)').forEach(btn =>
     btn.classList.toggle('active', btn.dataset.range === range)
   );
   updateURL();
   applyFilter();
   scheduleAutoRefresh();
+}
+
+function setSource(source) {
+  selectedSource = source;
+  document.querySelectorAll('.source-btn').forEach(btn =>
+    btn.classList.toggle('active', btn.dataset.source === source)
+  );
+  updateURL();
+  applyFilter();
 }
 
 function setHourlyTZ(mode) {
@@ -577,31 +633,67 @@ function buildFilterUI(allModels) {
     const checked = selectedModels.has(m);
     return `<label class="model-cb-label ${checked ? 'checked' : ''}" data-model="${esc(m)}">
       <input type="checkbox" value="${esc(m)}" ${checked ? 'checked' : ''} onchange="onModelToggle(this)">
+      <span class="model-cb-check">${checked ? '✓' : ''}</span>
       ${esc(m)}
     </label>`;
   }).join('');
+  updateModelDropdownLabel(allModels);
 }
+
+function updateModelDropdownLabel(allModels) {
+  const all = allModels || Array.from(document.querySelectorAll('#model-checkboxes input')).map(cb => cb.value);
+  const btn = document.getElementById('model-dropdown-btn');
+  const lbl = document.getElementById('model-dropdown-label');
+  if (!lbl) return;
+  const isAll = isDefaultModelSelection(all);
+  const none  = selectedModels.size === 0;
+  if (isAll)       { lbl.textContent = 'All Models'; btn.classList.remove('has-selection'); }
+  else if (none)   { lbl.textContent = 'No Models';  btn.classList.add('has-selection'); }
+  else             { lbl.textContent = `${selectedModels.size} / ${all.length} models`; btn.classList.add('has-selection'); }
+}
+
+function toggleModelDropdown(e) {
+  e.stopPropagation();
+  const btn   = document.getElementById('model-dropdown-btn');
+  const panel = document.getElementById('model-dropdown-panel');
+  const open  = panel.classList.toggle('open');
+  btn.classList.toggle('open', open);
+}
+
+document.addEventListener('click', function(e) {
+  const dd = document.getElementById('model-dropdown');
+  if (dd && !dd.contains(e.target)) {
+    document.getElementById('model-dropdown-panel')?.classList.remove('open');
+    document.getElementById('model-dropdown-btn')?.classList.remove('open');
+  }
+});
 
 function onModelToggle(cb) {
   const label = cb.closest('label');
-  if (cb.checked) { selectedModels.add(cb.value);    label.classList.add('checked'); }
-  else            { selectedModels.delete(cb.value); label.classList.remove('checked'); }
+  const check = label.querySelector('.model-cb-check');
+  if (cb.checked) { selectedModels.add(cb.value);    label.classList.add('checked');    if(check) check.textContent='✓'; }
+  else            { selectedModels.delete(cb.value); label.classList.remove('checked'); if(check) check.textContent='';  }
+  updateModelDropdownLabel();
   updateURL();
   applyFilter();
 }
 
 function selectAllModels() {
   document.querySelectorAll('#model-checkboxes input').forEach(cb => {
-    cb.checked = true; selectedModels.add(cb.value); cb.closest('label').classList.add('checked');
+    cb.checked = true; selectedModels.add(cb.value);
+    const lbl = cb.closest('label'); lbl.classList.add('checked');
+    const chk = lbl.querySelector('.model-cb-check'); if(chk) chk.textContent='✓';
   });
-  updateURL(); applyFilter();
+  updateModelDropdownLabel(); updateURL(); applyFilter();
 }
 
 function clearAllModels() {
   document.querySelectorAll('#model-checkboxes input').forEach(cb => {
-    cb.checked = false; selectedModels.delete(cb.value); cb.closest('label').classList.remove('checked');
+    cb.checked = false; selectedModels.delete(cb.value);
+    const lbl = cb.closest('label'); lbl.classList.remove('checked');
+    const chk = lbl.querySelector('.model-cb-check'); if(chk) chk.textContent='';
   });
-  updateURL(); applyFilter();
+  updateModelDropdownLabel(); updateURL(); applyFilter();
 }
 
 // ── URL persistence ────────────────────────────────────────────────────────
@@ -609,6 +701,7 @@ function updateURL() {
   const allModels = Array.from(document.querySelectorAll('#model-checkboxes input')).map(cb => cb.value);
   const params = new URLSearchParams();
   if (selectedRange !== '30d') params.set('range', selectedRange);
+  if (selectedSource !== 'all') params.set('source', selectedSource);
   if (!isDefaultModelSelection(allModels)) params.set('models', Array.from(selectedModels).join(','));
   const search = params.toString() ? '?' + params.toString() : '';
   history.replaceState(null, '', window.location.pathname + search);
@@ -659,7 +752,9 @@ function applyFilter() {
 
   // Filter daily rows by model + date range
   const filteredDaily = rawData.daily_by_model.filter(r =>
-    selectedModels.has(r.model) && (!start || r.day >= start) && (!end || r.day <= end)
+    selectedModels.has(r.model) &&
+    (!start || r.day >= start) && (!end || r.day <= end) &&
+    (selectedSource === 'all' || r.source === selectedSource)
   );
 
   // Daily chart: aggregate by day
@@ -688,7 +783,9 @@ function applyFilter() {
 
   // Filter sessions by model + date range
   const filteredSessions = rawData.sessions_all.filter(s =>
-    selectedModels.has(s.model) && (!start || s.last_date >= start) && (!end || s.last_date <= end)
+    selectedModels.has(s.model) &&
+    (!start || s.last_date >= start) && (!end || s.last_date <= end) &&
+    (selectedSource === 'all' || s.source === selectedSource)
   );
 
   // Add session counts into modelMap
@@ -742,7 +839,8 @@ function applyFilter() {
 
   // Hourly aggregation (filtered by model + range, then bucketed by UTC hour)
   const hourlySrc = (rawData.hourly_by_model || []).filter(r =>
-    selectedModels.has(r.model) && (!cutoff || r.day >= cutoff)
+    selectedModels.has(r.model) && (!start || r.day >= start) &&
+    (selectedSource === 'all' || r.source === selectedSource)
   );
   const hourlyAgg = aggregateHourly(hourlySrc, hourlyTZ);
 
@@ -1200,8 +1298,13 @@ async function loadData() {
     if (isFirstLoad) {
       // Restore range from URL, mark active button
       selectedRange = readURLRange();
-      document.querySelectorAll('.range-btn').forEach(btn =>
+      document.querySelectorAll('.range-btn:not(.source-btn)').forEach(btn =>
         btn.classList.toggle('active', btn.dataset.range === selectedRange)
+      );
+      // Restore source from URL, mark active button
+      selectedSource = readURLSource();
+      document.querySelectorAll('.source-btn').forEach(btn =>
+        btn.classList.toggle('active', btn.dataset.source === selectedSource)
       );
       // Mark default TZ button active
       document.querySelectorAll('.tz-btn').forEach(btn =>
@@ -1242,13 +1345,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
-        if self.path in ("/", "/index.html"):
+        from urllib.parse import urlparse
+        path = urlparse(self.path).path  # strip query string
+        if path in ("/", "/index.html"):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
             self.wfile.write(HTML_TEMPLATE.encode("utf-8"))
 
-        elif self.path == "/api/data":
+        elif path == "/api/data":
             data = get_dashboard_data()
             body = json.dumps(data).encode("utf-8")
             self.send_response(200)

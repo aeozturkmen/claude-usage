@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 XCODE_PROJECTS_DIR = Path.home() / "Library" / "Developer" / "Xcode" / "CodingAssistant" / "ClaudeAgentConfig" / "projects"
+COWORK_SESSIONS_DIR = Path.home() / "Library" / "Application Support" / "Claude" / "local-agent-mode-sessions"
 DB_PATH = Path.home() / ".claude" / "usage.db"
 DEFAULT_PROJECTS_DIRS = [PROJECTS_DIR, XCODE_PROJECTS_DIR]
 
@@ -197,6 +198,125 @@ def parse_jsonl_file(filepath):
                     # Dedup: last record per message_id wins (final usage tallies)
                     if message_id:
                         seen_messages[message_id] = turn
+                    else:
+                        turns_no_id.append(turn)
+
+    except Exception as e:
+        print(f"  Warning: error reading {filepath}: {e}")
+
+    turns = turns_no_id + list(seen_messages.values())
+    return list(session_meta.values()), turns, line_count
+
+
+def parse_cowork_audit_file(filepath):
+    """Parse a Cowork audit.jsonl file and return (session_metas, turns, line_count).
+
+    Cowork audit files use a different format than Claude Code JSONL:
+    - session_id is top-level (not sessionId)
+    - timestamp is _audit_timestamp
+    - model comes from system init record
+    - message uuid is top-level (not message.id)
+    """
+    session_meta = {}
+    seen_messages = {}  # uuid -> turn (dedup)
+    turns_no_id = []
+    line_count = 0
+    session_models = {}
+    session_cwds = {}
+
+    try:
+        with open(filepath, encoding="utf-8", errors="replace") as f:
+            for line_count, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                rtype = record.get("type")
+                session_id = record.get("session_id")
+                if not session_id:
+                    continue
+
+                timestamp = record.get("_audit_timestamp", "")
+
+                # Grab model + cwd from system init
+                if rtype == "system" and record.get("subtype") == "init":
+                    model = record.get("model", "")
+                    cwd = record.get("cwd", "")
+                    if model:
+                        session_models[session_id] = model
+                    if cwd:
+                        session_cwds[session_id] = cwd
+                    if session_id not in session_meta:
+                        session_meta[session_id] = {
+                            "session_id": session_id,
+                            "project_name": "cowork",
+                            "first_timestamp": timestamp,
+                            "last_timestamp": timestamp,
+                            "git_branch": "",
+                            "model": model,
+                        }
+                    continue
+
+                # Only track sessions from assistant messages (not user).
+                # user messages use the outer Cowork UI session_id which has no
+                # model/token data; assistant messages use the inner Claude session_id
+                # that matches the system init record.
+                if rtype != "assistant":
+                    continue
+
+                if session_id not in session_meta:
+                    session_meta[session_id] = {
+                        "session_id": session_id,
+                        "project_name": "cowork",
+                        "first_timestamp": timestamp,
+                        "last_timestamp": timestamp,
+                        "git_branch": "",
+                        "model": session_models.get(session_id),
+                    }
+                else:
+                    meta = session_meta[session_id]
+                    if timestamp and (not meta["first_timestamp"] or timestamp < meta["first_timestamp"]):
+                        meta["first_timestamp"] = timestamp
+                    if timestamp and (not meta["last_timestamp"] or timestamp > meta["last_timestamp"]):
+                        meta["last_timestamp"] = timestamp
+
+                if rtype == "assistant":
+                    msg = record.get("message", {})
+                    usage = msg.get("usage", {})
+                    uuid = record.get("uuid", "")
+                    model = session_models.get(session_id, "")
+                    cwd = session_cwds.get(session_id, "")
+
+                    input_tokens = usage.get("input_tokens", 0) or 0
+                    output_tokens = usage.get("output_tokens", 0) or 0
+                    cache_read = usage.get("cache_read_input_tokens", 0) or 0
+                    cache_creation = usage.get("cache_creation_input_tokens", 0) or 0
+
+                    if input_tokens + output_tokens + cache_read + cache_creation == 0:
+                        continue
+
+                    if model:
+                        session_meta[session_id]["model"] = model
+
+                    turn = {
+                        "session_id": session_id,
+                        "timestamp": timestamp,
+                        "model": model,
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "cache_read_tokens": cache_read,
+                        "cache_creation_tokens": cache_creation,
+                        "tool_name": None,
+                        "cwd": cwd,
+                        "message_id": uuid,
+                    }
+
+                    if uuid:
+                        seen_messages[uuid] = turn
                     else:
                         turns_no_id.append(turn)
 
@@ -483,6 +603,59 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
             updated_files += 1
 
         # Record file as processed (line_count already known from the single read)
+        conn.execute("""
+            INSERT OR REPLACE INTO processed_files (path, mtime, lines)
+            VALUES (?, ?, ?)
+        """, (filepath, mtime, line_count))
+        conn.commit()
+
+    # Scan Cowork audit files
+    cowork_audit_files = []
+    if COWORK_SESSIONS_DIR.exists():
+        if verbose:
+            print(f"Scanning {COWORK_SESSIONS_DIR} (Cowork) ...")
+        cowork_audit_files = glob.glob(
+            str(COWORK_SESSIONS_DIR / "**" / "audit.jsonl"), recursive=True
+        )
+        cowork_audit_files.sort()
+
+    for filepath in cowork_audit_files:
+        try:
+            mtime = os.path.getmtime(filepath)
+        except OSError:
+            continue
+
+        row = conn.execute(
+            "SELECT mtime, lines FROM processed_files WHERE path = ?",
+            (filepath,)
+        ).fetchone()
+
+        if row and abs(row["mtime"] - mtime) < 0.01:
+            skipped_files += 1
+            continue
+
+        is_new = row is None
+        if verbose:
+            status = "NEW" if is_new else "UPD"
+            print(f"  [{status}] {filepath}")
+
+        # Always full-parse Cowork files (model is in line 1 system init,
+        # so we can't skip old lines; uuid dedup prevents double-counting)
+        session_metas, turns, line_count = parse_cowork_audit_file(filepath)
+
+        if turns or session_metas:
+            sessions = aggregate_sessions(session_metas, turns)
+            upsert_sessions(conn, sessions)
+            insert_turns(conn, turns)
+            for s in sessions:
+                total_sessions.add(s["session_id"])
+            total_turns += len(turns)
+
+        if is_new:
+            new_files += 1
+        else:
+            updated_files += 1
+
         conn.execute("""
             INSERT OR REPLACE INTO processed_files (path, mtime, lines)
             VALUES (?, ?, ?)
