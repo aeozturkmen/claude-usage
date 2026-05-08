@@ -1325,10 +1325,20 @@ async function loadData() {
 }
 
 let autoRefreshTimer = null;
+
+async function autoScan() {
+  try {
+    await fetch('/api/autoscan', { method: 'POST' });
+  } catch(e) {
+    console.error('Auto-scan failed:', e);
+  }
+  await loadData();
+}
+
 function scheduleAutoRefresh() {
   if (autoRefreshTimer) { clearInterval(autoRefreshTimer); autoRefreshTimer = null; }
   if (rangeIncludesToday(selectedRange)) {
-    autoRefreshTimer = setInterval(loadData, 30000);
+    autoRefreshTimer = setInterval(autoScan, 30000);
   }
 }
 
@@ -1387,6 +1397,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        elif self.path == "/api/autoscan":
+            # Incremental scan: pick up new/modified JSONL files without wiping the DB.
+            import scanner
+            result = scanner.scan(
+                db_path=DB_PATH,
+                projects_dirs=scanner.DEFAULT_PROJECTS_DIRS,
+                verbose=False,
+            )
+            body = json.dumps(result).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         else:
             self.send_response(404)
             self.end_headers()
