@@ -248,8 +248,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .stat-card .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 6px; }
   .stat-card .value { font-size: 20px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .stat-card .sub { color: var(--muted); font-size: 11px; margin-top: 4px; }
-  .stat-card.clickable { cursor: pointer; }
-  .stat-card.clickable:hover { border-color: var(--muted); }
+  .budget-card { font: inherit; color: inherit; text-align: left; cursor: pointer; width: 100%; grid-column: span 2;
+    background: linear-gradient(180deg, rgba(217,119,87,0.10), rgba(217,119,87,0.03)), var(--card);
+    border-color: rgba(217,119,87,0.45); transition: border-color .15s, transform .15s, box-shadow .15s; }
+  .budget-card:hover { border-color: var(--accent); transform: translateY(-1px); box-shadow: 0 4px 14px rgba(217,119,87,0.15); }
+  .budget-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .budget-card .label, .budget-card .sub { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .budget-card .label { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+  .budget-pill { flex-shrink: 0; font-size: 10px; letter-spacing: 0; text-transform: none; color: var(--accent);
+    border: 1px solid rgba(217,119,87,0.5); border-radius: 999px; padding: 1px 7px; }
+  .budget-card:hover .budget-pill { background: var(--accent); color: #fff; }
+  .budget-bar { height: 4px; border-radius: 2px; background: var(--border); margin-top: 8px; overflow: hidden; }
+  .budget-bar > span { display: block; height: 100%; border-radius: 2px; }
   .title-cell { max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
   .charts-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 24px; }
@@ -907,8 +917,8 @@ function renderStats(t) {
     { label: 'Est. Cost',      value: fmtCostBig(t.cost),          sub: 'API pricing, Sep 2026', color: '#4ade80' },
     budgetStat(),
   ];
-  document.getElementById('stats-row').innerHTML = stats.map(s => `
-    <div class="stat-card${s.onclick ? ' clickable' : ''}"${s.onclick ? ` onclick="${s.onclick}" title="${esc(s.hint || '')}"` : ''}>
+  document.getElementById('stats-row').innerHTML = stats.map(s => s.html || `
+    <div class="stat-card">
       <div class="label">${s.label}</div>
       <div class="value" style="${s.color ? 'color:' + s.color : ''}">${esc(s.value)}</div>
       ${s.sub ? `<div class="sub">${esc(s.sub)}</div>` : ''}
@@ -957,15 +967,22 @@ function monthProjection() {
 function budgetStat() {
   const { mtd, projected } = monthProjection();
   const budget = getBudget();
-  const stat = { label: 'Month to Date', value: fmtCostBig(mtd), onclick: 'editBudget()', hint: 'Click to set a monthly budget' };
-  if (!budget) {
-    stat.sub = `proj. ${fmtCostBig(projected)} · set budget`;
-    return stat;
+  let color = '', sub = `proj. ${fmtCostBig(projected)} by month end`, bar = '';
+  if (budget) {
+    const pct = mtd / budget * 100;
+    color = projected > budget ? '#f87171' : pct > 80 ? '#fbbf24' : '#4ade80';
+    sub = `${Math.round(pct)}% of ${fmtCostBig(budget)} · proj. ${fmtCostBig(projected)}`;
+    bar = `<div class="budget-bar"><span style="width:${Math.min(pct, 100).toFixed(1)}%;background:${color}"></span></div>`;
   }
-  const pct = Math.round(mtd / budget * 100);
-  stat.sub = `${pct}% of ${fmtCostBig(budget)} · proj. ${fmtCostBig(projected)}`;
-  stat.color = projected > budget ? '#f87171' : mtd > budget * 0.8 ? '#fbbf24' : '#4ade80';
-  return stat;
+  const pill = budget ? '&#9998; Budget' : '+ Set budget';
+  return { html: `
+    <button type="button" class="stat-card budget-card" onclick="editBudget()"
+            title="${budget ? 'Edit' : 'Set'} monthly budget (all Claude models, ignores filters)">
+      <div class="label"><span>Month to Date</span><span class="budget-pill">${pill}</span></div>
+      <div class="value" style="${color ? 'color:' + color : ''}">${esc(fmtCostBig(mtd))}</div>
+      <div class="sub">${esc(sub)}</div>
+      ${bar}
+    </button>` };
 }
 
 // Bucket rows into 24 hours (display-TZ), summing turns + output, and count
