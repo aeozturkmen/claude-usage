@@ -14,48 +14,10 @@ import sqlite3
 from pathlib import Path
 from datetime import datetime, date, timedelta
 
+from pricing import PRICING, get_pricing, calc_cost  # noqa: F401 (re-exported for tests)
+
 DB_PATH = Path.home() / ".claude" / "usage.db"
 
-PRICING = {
-    "claude-opus-4-7":   {"input": 5.00, "output": 25.00, "cache_read": 0.50, "cache_write": 6.25},
-    "claude-opus-4-6":   {"input": 5.00, "output": 25.00, "cache_read": 0.50, "cache_write": 6.25},
-    "claude-opus-4-5":   {"input": 5.00, "output": 25.00, "cache_read": 0.50, "cache_write": 6.25},
-    "claude-sonnet-4-7": {"input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_write": 3.75},
-    "claude-sonnet-4-6": {"input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_write": 3.75},
-    "claude-sonnet-4-5": {"input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_write": 3.75},
-    "claude-haiku-4-7":  {"input": 1.00, "output":  5.00, "cache_read": 0.10, "cache_write": 1.25},
-    "claude-haiku-4-6":  {"input": 1.00, "output":  5.00, "cache_read": 0.10, "cache_write": 1.25},
-    "claude-haiku-4-5":  {"input": 1.00, "output":  5.00, "cache_read": 0.10, "cache_write": 1.25},
-}
-
-def get_pricing(model):
-    if not model:
-        return None
-    if model in PRICING:
-        return PRICING[model]
-    for key in PRICING:
-        if model.startswith(key):
-            return PRICING[key]
-    # Substring fallback: match model family by keyword
-    m = model.lower()
-    if "opus" in m:
-        return PRICING["claude-opus-4-7"]
-    if "sonnet" in m:
-        return PRICING["claude-sonnet-4-6"]
-    if "haiku" in m:
-        return PRICING["claude-haiku-4-5"]
-    return None
-
-def calc_cost(model, inp, out, cache_read, cache_creation):
-    p = get_pricing(model)
-    if not p:
-        return 0.0
-    return (
-        inp            * p["input"]       / 1_000_000 +
-        out            * p["output"]      / 1_000_000 +
-        cache_read     * p["cache_read"]  / 1_000_000 +
-        cache_creation * p["cache_write"] / 1_000_000
-    )
 
 def fmt(n):
     if n >= 1_000_000:
@@ -74,7 +36,10 @@ def require_db():
     if not DB_PATH.exists():
         print("Database not found. Run: python cli.py scan")
         sys.exit(1)
-    return sqlite3.connect(DB_PATH)
+    from scanner import get_db, init_db
+    conn = get_db(DB_PATH)
+    init_db(conn)  # apply schema migrations for DBs created by older versions
+    return conn
 
 
 # ── Commands ──────────────────────────────────────────────────────────────────
@@ -96,9 +61,10 @@ def cmd_today():
             SUM(output_tokens)         as out,
             SUM(cache_read_tokens)     as cr,
             SUM(cache_creation_tokens) as cc,
+            SUM(cost_usd)                as cost,
             COUNT(*)                   as turns
         FROM turns
-        WHERE substr(timestamp, 1, 10) = ?
+        WHERE date(timestamp, 'localtime') = ?
         GROUP BY model
         ORDER BY inp + out DESC
     """, (today,)).fetchall()
@@ -106,7 +72,7 @@ def cmd_today():
     sessions = conn.execute("""
         SELECT COUNT(DISTINCT session_id) as cnt
         FROM turns
-        WHERE substr(timestamp, 1, 10) = ?
+        WHERE date(timestamp, 'localtime') = ?
     """, (today,)).fetchone()
 
     print()
@@ -123,7 +89,7 @@ def cmd_today():
     total_cost = 0.0
 
     for r in rows:
-        cost = calc_cost(r["model"], r["inp"] or 0, r["out"] or 0, r["cr"] or 0, r["cc"] or 0)
+        cost = (r["cost"] or 0)
         total_cost += cost
         total_inp += r["inp"] or 0
         total_out += r["out"] or 0
@@ -154,15 +120,16 @@ def cmd_week():
 
     by_day_model = conn.execute("""
         SELECT
-            substr(timestamp, 1, 10)   as day,
+            date(timestamp, 'localtime')   as day,
             COALESCE(model, 'unknown') as model,
             SUM(input_tokens)          as inp,
             SUM(output_tokens)         as out,
             SUM(cache_read_tokens)     as cr,
             SUM(cache_creation_tokens) as cc,
+            SUM(cost_usd)                as cost,
             COUNT(*)                   as turns
         FROM turns
-        WHERE substr(timestamp, 1, 10) BETWEEN ? AND ?
+        WHERE date(timestamp, 'localtime') BETWEEN ? AND ?
         GROUP BY day, model
     """, (start, end)).fetchall()
 
@@ -173,9 +140,10 @@ def cmd_week():
             SUM(output_tokens)         as out,
             SUM(cache_read_tokens)     as cr,
             SUM(cache_creation_tokens) as cc,
+            SUM(cost_usd)                as cost,
             COUNT(*)                   as turns
         FROM turns
-        WHERE substr(timestamp, 1, 10) BETWEEN ? AND ?
+        WHERE date(timestamp, 'localtime') BETWEEN ? AND ?
         GROUP BY model
         ORDER BY inp + out DESC
     """, (start, end)).fetchall()
@@ -183,7 +151,7 @@ def cmd_week():
     sessions = conn.execute("""
         SELECT COUNT(DISTINCT session_id) as cnt
         FROM turns
-        WHERE substr(timestamp, 1, 10) BETWEEN ? AND ?
+        WHERE date(timestamp, 'localtime') BETWEEN ? AND ?
     """, (start, end)).fetchone()
 
     print()
@@ -205,7 +173,7 @@ def cmd_week():
         bucket["turns"] += r["turns"]
         bucket["inp"]   += r["inp"] or 0
         bucket["out"]   += r["out"] or 0
-        bucket["cost"]  += calc_cost(r["model"], r["inp"] or 0, r["out"] or 0, r["cr"] or 0, r["cc"] or 0)
+        bucket["cost"]  += (r["cost"] or 0)
 
     print("  By Day:")
     for i in range(7):
@@ -219,7 +187,7 @@ def cmd_week():
     total_inp = total_out = total_cr = total_cc = total_turns = 0
     total_cost = 0.0
     for r in by_model:
-        cost = calc_cost(r["model"], r["inp"] or 0, r["out"] or 0, r["cr"] or 0, r["cc"] or 0)
+        cost = (r["cost"] or 0)
         total_cost  += cost
         total_inp   += r["inp"] or 0
         total_out   += r["out"] or 0
@@ -259,6 +227,7 @@ def cmd_stats():
             SUM(output_tokens)            as out,
             SUM(cache_read_tokens)        as cr,
             SUM(cache_creation_tokens)    as cc,
+            SUM(cost_usd)                as cost,
             COUNT(*)                      as turns
         FROM turns
     """).fetchone()
@@ -271,6 +240,7 @@ def cmd_stats():
             SUM(output_tokens)         as out,
             SUM(cache_read_tokens)     as cr,
             SUM(cache_creation_tokens) as cc,
+            SUM(cost_usd)                as cost,
             COUNT(*)                   as turns,
             COUNT(DISTINCT session_id) as sessions
         FROM turns
@@ -300,7 +270,7 @@ def cmd_stats():
             AVG(daily_out) as avg_out
         FROM (
             SELECT
-                substr(timestamp, 1, 10) as day,
+                date(timestamp, 'localtime') as day,
                 SUM(input_tokens) as daily_inp,
                 SUM(output_tokens) as daily_out
             FROM turns
@@ -311,7 +281,7 @@ def cmd_stats():
 
     # Build total cost across all models
     total_cost = sum(
-        calc_cost(r["model"], r["inp"] or 0, r["out"] or 0, r["cr"] or 0, r["cc"] or 0)
+        (r["cost"] or 0)
         for r in by_model
     )
 
@@ -329,14 +299,14 @@ def cmd_stats():
     print(f"  Input tokens:     {fmt(totals['inp'] or 0):<12}  (raw prompt tokens)")
     print(f"  Output tokens:    {fmt(totals['out'] or 0):<12}  (generated tokens)")
     print(f"  Cache read:       {fmt(totals['cr'] or 0):<12}  (90% cheaper than input)")
-    print(f"  Cache creation:   {fmt(totals['cc'] or 0):<12}  (25% premium on input)")
+    print(f"  Cache creation:   {fmt(totals['cc'] or 0):<12}  (1.25x input for 5m TTL, 2x for 1h TTL)")
     print()
     print(f"  Est. total cost:  ${total_cost:.4f}")
     hr()
 
     print("  By Model:")
     for r in by_model:
-        cost = calc_cost(r["model"], r["inp"] or 0, r["out"] or 0, r["cr"] or 0, r["cc"] or 0)
+        cost = (r["cost"] or 0)
         print(f"    {r['model']:<30}  sessions={r['sessions']:<4}  turns={fmt(r['turns'] or 0):<6}  "
               f"in={fmt(r['inp'] or 0):<8}  out={fmt(r['out'] or 0):<8}  cost={fmt_cost(cost)}")
 

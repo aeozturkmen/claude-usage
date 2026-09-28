@@ -11,9 +11,11 @@ class TestGetPricing(unittest.TestCase):
         self.assertEqual(p["output"], 25.00)
 
     def test_all_known_models_have_pricing(self):
-        for model in ("claude-opus-4-7", "claude-opus-4-6", "claude-opus-4-5",
-                       "claude-sonnet-4-7", "claude-sonnet-4-6", "claude-sonnet-4-5",
-                       "claude-haiku-4-7", "claude-haiku-4-6", "claude-haiku-4-5"):
+        for model in ("claude-fable-5-1", "claude-fable-5", "claude-mythos-5-1",
+                       "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8",
+                       "claude-opus-4-7", "claude-opus-4-6", "claude-opus-4-5",
+                       "claude-sonnet-5", "claude-sonnet-4-6", "claude-sonnet-4-5",
+                       "claude-haiku-4-5"):
             p = get_pricing(model)
             self.assertGreater(p["input"], 0, f"Missing input price for {model}")
             self.assertGreater(p["output"], 0, f"Missing output price for {model}")
@@ -37,14 +39,34 @@ class TestGetPricing(unittest.TestCase):
         self.assertEqual(p["output"], 15.00)
 
     def test_substring_match_opus(self):
-        p = get_pricing("new-opus-5-model")
+        p = get_pricing("new-opus-6-model")
         self.assertEqual(p["input"], 5.00)
         self.assertEqual(p["output"], 25.00)
 
     def test_substring_match_sonnet(self):
+        # Unknown sonnet variants fall back to the newest Sonnet (5)
         p = get_pricing("custom-sonnet-variant")
-        self.assertEqual(p["input"], 3.00)
-        self.assertEqual(p["output"], 15.00)
+        self.assertEqual(p["input"], 2.00)
+        self.assertEqual(p["output"], 10.00)
+
+    def test_substring_match_fable_and_mythos(self):
+        self.assertEqual(get_pricing("claude-fable-6")["input"], 10.00)
+        self.assertEqual(get_pricing("claude-mythos-preview")["input"], 10.00)
+
+    def test_context_window_suffix_is_stripped(self):
+        """Claude Code logs 1M-context sessions as e.g. claude-opus-4-7[1m]."""
+        self.assertIs(get_pricing("claude-opus-4-7[1m]"), PRICING["claude-opus-4-7"])
+        self.assertIs(get_pricing("claude-sonnet-4-6[1m]"), PRICING["claude-sonnet-4-6"])
+
+    def test_longest_prefix_wins(self):
+        """opus-5-5 must not be priced as opus-5 (different price)."""
+        self.assertIs(get_pricing("claude-opus-5-5[1m]"), PRICING["claude-opus-5-5"])
+        self.assertIs(get_pricing("claude-fable-5-1-20260901"), PRICING["claude-fable-5-1"])
+
+    def test_minor_version_not_swallowed_by_major(self):
+        """claude-opus-4 ($15) must not match a future claude-opus-4-9."""
+        self.assertIs(get_pricing("claude-opus-4-20250514"), PRICING["claude-opus-4"])
+        self.assertIsNot(get_pricing("claude-opus-4-9"), PRICING["claude-opus-4"])
 
     def test_substring_match_haiku(self):
         p = get_pricing("experimental-haiku-fast")
@@ -95,6 +117,24 @@ class TestCalcCost(unittest.TestCase):
         # 1M cache_creation of Opus at $5 * 1.25 = $6.25
         cost = calc_cost("claude-opus-4-6", 0, 0, 0, 1_000_000)
         self.assertAlmostEqual(cost, 6.25)
+
+    def test_cache_creation_1h_ttl(self):
+        # 1h TTL cache writes cost 2x input: 1M on Opus 5 = $10
+        cost = calc_cost("claude-opus-5", 0, 0, 0, 1_000_000, 1_000_000)
+        self.assertAlmostEqual(cost, 10.00)
+
+    def test_cache_creation_mixed_ttl(self):
+        # 600K 5m ($6.25/M) + 400K 1h ($10/M) on Opus 4.8
+        cost = calc_cost("claude-opus-4-8", 0, 0, 0, 1_000_000, 400_000)
+        self.assertAlmostEqual(cost, 0.6 * 6.25 + 0.4 * 10.00)
+
+    def test_cache_creation_1h_capped_at_total(self):
+        cost = calc_cost("claude-opus-5", 0, 0, 0, 100, 500)
+        self.assertAlmostEqual(cost, 100 * 10.00 / 1_000_000)
+
+    def test_fable_5_1_cache_read_rate(self):
+        # Fable 5.1 cache reads are $0.25/MTok (0.025x input)
+        self.assertAlmostEqual(calc_cost("claude-fable-5-1", 0, 0, 1_000_000, 0), 0.25)
 
     def test_combined_cost(self):
         cost = calc_cost("claude-haiku-4-5",
@@ -152,16 +192,30 @@ class TestPricingConsistency(unittest.TestCase):
             self.assertEqual(p["output"], 25.00, f"{model} output price wrong")
 
     def test_sonnet_pricing(self):
-        for model in ("claude-sonnet-4-7", "claude-sonnet-4-6", "claude-sonnet-4-5"):
+        for model in ("claude-sonnet-4-6", "claude-sonnet-4-5"):
             p = get_pricing(model)
             self.assertEqual(p["input"], 3.00, f"{model} input price wrong")
             self.assertEqual(p["output"], 15.00, f"{model} output price wrong")
 
     def test_haiku_pricing(self):
-        for model in ("claude-haiku-4-7", "claude-haiku-4-6", "claude-haiku-4-5"):
+        p = get_pricing("claude-haiku-4-5")
+        self.assertEqual(p["input"], 1.00)
+        self.assertEqual(p["output"], 5.00)
+
+    def test_current_generation_pricing(self):
+        expected = {
+            "claude-fable-5-1": (10.00, 50.00),
+            "claude-fable-5":   (10.00, 50.00),
+            "claude-opus-5-5":  (4.00, 20.00),
+            "claude-opus-5":    (5.00, 25.00),
+            "claude-opus-4-8":  (5.00, 25.00),
+            "claude-sonnet-5":  (2.00, 10.00),
+        }
+        for model, (inp, out) in expected.items():
             p = get_pricing(model)
-            self.assertEqual(p["input"], 1.00, f"{model} input price wrong")
-            self.assertEqual(p["output"], 5.00, f"{model} output price wrong")
+            self.assertEqual((p["input"], p["output"]), (inp, out), model)
+            self.assertAlmostEqual(p["cache_write"], inp * 1.25, msg=model)
+            self.assertAlmostEqual(p["cache_write_1h"], inp * 2.0, msg=model)
 
 
 if __name__ == "__main__":

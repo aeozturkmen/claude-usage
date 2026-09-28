@@ -6,8 +6,10 @@ import json
 import os
 import glob
 import sqlite3
+from functools import lru_cache
 from pathlib import Path
-from datetime import datetime, timezone
+
+from pricing import calc_cost, pricing_fingerprint
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 XCODE_PROJECTS_DIR = Path.home() / "Library" / "Developer" / "Xcode" / "CodingAssistant" / "ClaudeAgentConfig" / "projects"
@@ -15,8 +17,20 @@ COWORK_SESSIONS_DIR = Path.home() / "Library" / "Application Support" / "Claude"
 DB_PATH = Path.home() / ".claude" / "usage.db"
 DEFAULT_PROJECTS_DIRS = [PROJECTS_DIR, XCODE_PROJECTS_DIR]
 
+# Bump when a data migration that re-reads the JSONL files is added to init_db()
+SCHEMA_VERSION = 2
+
 # Higher number = higher priority when choosing a session's primary model
-MODEL_PRIORITY = {"opus": 3, "sonnet": 2, "haiku": 1}
+MODEL_PRIORITY = {"fable": 4, "mythos": 4, "opus": 3, "sonnet": 2, "haiku": 1}
+
+TITLE_MAX_LEN = 120
+
+# Token counters that only ever grow while a response streams. When the same
+# message is seen again (a scan that landed mid-stream, or a transcript copied
+# into a resumed session) the DB keeps the largest value.
+_TALLY_COLUMNS = ("input_tokens", "output_tokens", "cache_read_tokens",
+                  "cache_creation_tokens", "cache_creation_1h_tokens",
+                  "web_search_requests")
 
 
 def _model_priority(model):
@@ -30,16 +44,111 @@ def _model_priority(model):
     return 0
 
 
+def _cache_creation_1h(usage):
+    """Tokens written with the 1-hour cache TTL (billed at 2x input vs 1.25x for 5m)."""
+    breakdown = usage.get("cache_creation") or {}
+    if not isinstance(breakdown, dict):
+        return 0
+    return breakdown.get("ephemeral_1h_input_tokens", 0) or 0
+
+
+def _web_search_requests(usage):
+    server_tools = usage.get("server_tool_use") or {}
+    if not isinstance(server_tools, dict):
+        return 0
+    return server_tools.get("web_search_requests", 0) or 0
+
+
+def turn_cost(t):
+    """USD cost of one turn dict / row (see pricing.calc_cost)."""
+    return calc_cost(
+        t["model"], t["input_tokens"] or 0, t["output_tokens"] or 0,
+        t["cache_read_tokens"] or 0, t["cache_creation_tokens"] or 0,
+        t["cache_creation_1h_tokens"] or 0, t["speed"],
+        t["web_search_requests"] or 0,
+    )
+
+
+def _make_turn(session_id, timestamp, model, usage, tool_name, cwd, message_id):
+    """Build a turn dict from an assistant message's usage, or None if it has no tokens."""
+    input_tokens = usage.get("input_tokens", 0) or 0
+    output_tokens = usage.get("output_tokens", 0) or 0
+    cache_read = usage.get("cache_read_input_tokens", 0) or 0
+    cache_creation = usage.get("cache_creation_input_tokens", 0) or 0
+    if input_tokens + output_tokens + cache_read + cache_creation == 0:
+        return None
+    turn = {
+        "session_id": session_id,
+        "timestamp": timestamp,
+        "model": model,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_tokens": cache_read,
+        "cache_creation_tokens": cache_creation,
+        "cache_creation_1h_tokens": _cache_creation_1h(usage),
+        "speed": usage.get("speed"),
+        "web_search_requests": _web_search_requests(usage),
+        "tool_name": tool_name,
+        "cwd": cwd,
+        "message_id": message_id,
+    }
+    turn["cost_usd"] = turn_cost(turn)
+    return turn
+
+
+def _clean_title(text):
+    text = " ".join((text or "").split())
+    if len(text) > TITLE_MAX_LEN:
+        text = text[:TITLE_MAX_LEN - 1] + "…"
+    return text or None
+
+
+def _first_prompt_text(record):
+    """Text of a user prompt, ignoring tool results and injected system/command blocks."""
+    content = (record.get("message") or {}).get("content")
+    if isinstance(content, list):
+        content = next((c.get("text") for c in content
+                        if isinstance(c, dict) and c.get("type") == "text"), None)
+    if not isinstance(content, str) or record.get("isMeta"):
+        return None
+    content = content.strip()
+    if not content or content.startswith("<"):
+        return None
+    return content
+
+
+# Lookups by message_id must repeat the partial index's condition, otherwise
+# SQLite can't use idx_turns_message_id and scans the whole table per row.
+# SQL expression pricing a turns row with pricing.calc_cost (see _register_functions)
+PRICE_SQL = """calc_cost(model, COALESCE(input_tokens, 0), COALESCE(output_tokens, 0),
+                 COALESCE(cache_read_tokens, 0), COALESCE(cache_creation_tokens, 0),
+                 COALESCE(cache_creation_1h_tokens, 0), speed,
+                 COALESCE(web_search_requests, 0))"""
+
+
+def _register_functions(conn):
+    conn.create_function("calc_cost", 8, calc_cost)
+
+
 def get_db(db_path=DB_PATH):
     # Ensure the parent directory exists — on a fresh install or CI runner
     # ~/.claude may not yet exist, and sqlite3.connect needs the parent dir.
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
+    _register_functions(conn)
     return conn
 
 
+def _add_column(conn, table, column, decl):
+    try:
+        conn.execute(f"SELECT {column} FROM {table} LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
 def init_db(conn):
+    _register_functions(conn)
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS sessions (
             session_id      TEXT PRIMARY KEY,
@@ -75,37 +184,165 @@ def init_db(conn):
             lines   INTEGER
         );
 
+        CREATE TABLE IF NOT EXISTS meta (
+            key     TEXT PRIMARY KEY,
+            value   TEXT
+        );
+
         CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id);
         CREATE INDEX IF NOT EXISTS idx_turns_timestamp ON turns(timestamp);
         CREATE INDEX IF NOT EXISTS idx_sessions_first ON sessions(first_timestamp);
     """)
-    # Add message_id column if upgrading from older schema
-    try:
-        conn.execute("SELECT message_id FROM turns LIMIT 1")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE turns ADD COLUMN message_id TEXT")
+    # Columns added after the first release (no-ops on up-to-date DBs)
+    _add_column(conn, "turns", "message_id", "TEXT")
+    _add_column(conn, "turns", "cache_creation_1h_tokens", "INTEGER DEFAULT 0")
+    _add_column(conn, "turns", "speed", "TEXT")
+    _add_column(conn, "turns", "web_search_requests", "INTEGER DEFAULT 0")
+    _add_column(conn, "turns", "cost_usd", "REAL DEFAULT 0")
+    _add_column(conn, "sessions", "total_cache_creation_1h", "INTEGER DEFAULT 0")
+    _add_column(conn, "sessions", "total_cost", "REAL DEFAULT 0")
+    _add_column(conn, "sessions", "title", "TEXT")
     # Conditional unique index: only dedup non-null message IDs
     conn.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_message_id
         ON turns(message_id) WHERE message_id IS NOT NULL AND message_id != ''
     """)
     conn.commit()
+    # Data migrations, tracked via user_version so an interrupted run resumes
+    if conn.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
+        backfill_from_files(conn)
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        conn.commit()
+    # Recompute stored costs whenever the pricing table changes
+    fingerprint = pricing_fingerprint()
+    row = conn.execute("SELECT value FROM meta WHERE key = 'pricing'").fetchone()
+    if not row or row[0] != fingerprint:
+        recompute_costs(conn)
+        conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('pricing', ?)", (fingerprint,))
+        conn.commit()
+
+
+def recompute_costs(conn):
+    """Re-price every stored turn with the current pricing table."""
+    conn.execute(f"UPDATE turns SET cost_usd = {PRICE_SQL}")
+    _recompute_session_totals(conn)
+
+
+def backfill_from_files(conn):
+    """Re-read every processed transcript that still exists and refresh the
+    per-turn fields added in later versions (1h cache writes, speed, web
+    search, final streaming tallies) plus session titles. Turns whose source
+    file was cleaned up by Claude Code are kept as-is."""
+    rows = conn.execute("SELECT path FROM processed_files").fetchall()
+    for (path,) in rows:
+        if not os.path.exists(path):
+            continue
+        if os.path.basename(path) == "audit.jsonl":
+            metas, turns, _ = parse_cowork_audit_file(path)
+        else:
+            metas, turns, _ = parse_jsonl_file(path)
+        _update_existing_turns(conn, [t for t in turns if t.get("message_id")])
+        _update_titles(conn, metas)
+    recompute_costs(conn)
+    conn.commit()
+
+
+def _update_existing_turns(conn, turns):
+    conn.executemany(f"""
+        UPDATE turns SET
+            {", ".join(f"{c} = MAX(COALESCE({c}, 0), ?)" for c in _TALLY_COLUMNS)},
+            speed = COALESCE(?, speed)
+        WHERE message_id = ? AND message_id != ''
+    """, [tuple(t[c] for c in _TALLY_COLUMNS) + (t["speed"], t["message_id"]) for t in turns])
+
+
+def _update_titles(conn, metas):
+    """custom-title always wins; ai-title / first prompt only fill an empty title."""
+    for m in metas:
+        if m.get("custom_title"):
+            conn.execute("UPDATE sessions SET title = ? WHERE session_id = ?",
+                         (m["custom_title"], m["session_id"]))
+        elif m.get("fallback_title"):
+            conn.execute("UPDATE sessions SET title = ? WHERE session_id = ? AND (title IS NULL OR title = '')",
+                         (m["fallback_title"], m["session_id"]))
+
+
+def _recompute_session_totals(conn):
+    """Recompute session totals from the turns table (source of truth)."""
+    conn.execute("""
+        UPDATE sessions SET
+            total_input_tokens = COALESCE((SELECT SUM(input_tokens) FROM turns WHERE turns.session_id = sessions.session_id), 0),
+            total_output_tokens = COALESCE((SELECT SUM(output_tokens) FROM turns WHERE turns.session_id = sessions.session_id), 0),
+            total_cache_read = COALESCE((SELECT SUM(cache_read_tokens) FROM turns WHERE turns.session_id = sessions.session_id), 0),
+            total_cache_creation = COALESCE((SELECT SUM(cache_creation_tokens) FROM turns WHERE turns.session_id = sessions.session_id), 0),
+            total_cache_creation_1h = COALESCE((SELECT SUM(cache_creation_1h_tokens) FROM turns WHERE turns.session_id = sessions.session_id), 0),
+            total_cost = COALESCE((SELECT SUM(cost_usd) FROM turns WHERE turns.session_id = sessions.session_id), 0),
+            turn_count = COALESCE((SELECT COUNT(*) FROM turns WHERE turns.session_id = sessions.session_id), 0)
+    """)
+
+
+@lru_cache(maxsize=None)
+def _worktree_parent(cwd):
+    """Resolve a git worktree checkout to its main repository path, else None.
+
+    Claude Code puts worktrees under <repo>/.claude/worktrees/<name>; other
+    worktrees are recognised by their `.git` file pointing at
+    <repo>/.git/worktrees/<name> (only while the checkout still exists).
+    """
+    marker = "/.claude/worktrees/"
+    if marker in cwd:
+        return cwd.split(marker)[0]
+    try:
+        with open(os.path.join(cwd, ".git"), encoding="utf-8") as f:
+            line = f.readline().strip()
+    except OSError:
+        return None
+    if line.startswith("gitdir:"):
+        gitdir = line[len("gitdir:"):].strip().replace("\\", "/")
+        if "/.git/worktrees/" in gitdir:
+            return gitdir.split("/.git/worktrees/")[0]
+    return None
 
 
 def project_name_from_cwd(cwd):
-    """Derive a friendly project name from cwd path."""
+    """Derive a friendly project name from cwd path (worktrees fold into their repo)."""
     if not cwd:
         return "unknown"
     # Normalize to forward slashes, take last 2 components
-    parts = cwd.replace("\\", "/").rstrip("/").split("/")
+    path = cwd.replace("\\", "/").rstrip("/")
+    path = _worktree_parent(path) or path
+    parts = path.split("/")
     if len(parts) >= 2:
         return "/".join(parts[-2:])
     return parts[-1] if parts else "unknown"
 
 
-def parse_jsonl_file(filepath):
+def _new_meta(session_id, project_name, timestamp, git_branch, model=None):
+    return {
+        "session_id": session_id,
+        "project_name": project_name,
+        "first_timestamp": timestamp,
+        "last_timestamp": timestamp,
+        "git_branch": git_branch,
+        "model": model,
+        "custom_title": None,
+        "fallback_title": None,
+    }
+
+
+def _touch_meta(meta, timestamp, git_branch=""):
+    if timestamp and (not meta["first_timestamp"] or timestamp < meta["first_timestamp"]):
+        meta["first_timestamp"] = timestamp
+    if timestamp and (not meta["last_timestamp"] or timestamp > meta["last_timestamp"]):
+        meta["last_timestamp"] = timestamp
+    if git_branch and not meta["git_branch"]:
+        meta["git_branch"] = git_branch
+
+
+def parse_jsonl_file(filepath, skip_lines=0):
     """Parse a JSONL file and return (session_metas, turns, line_count).
 
+    Lines up to `skip_lines` are skipped (incremental scans of a growing file).
     Deduplicates streaming events by message.id — Claude Code logs multiple
     JSONL records per API response, all sharing the same message.id. Only the
     last record per message_id is kept (it has the final usage tallies).
@@ -113,11 +350,14 @@ def parse_jsonl_file(filepath):
     seen_messages = {}  # message_id -> turn dict (dedup streaming records)
     turns_no_id = []    # turns without a message_id (kept as-is)
     session_meta = {}   # session_id -> dict
+    titles = {}         # session_id -> (custom_title, ai_title) seen before the session's first turn
     line_count = 0
 
     try:
         with open(filepath, encoding="utf-8", errors="replace") as f:
             for line_count, line in enumerate(f, 1):
+                if line_count <= skip_lines:
+                    continue
                 line = line.strip()
                 if not line:
                     continue
@@ -127,11 +367,20 @@ def parse_jsonl_file(filepath):
                     continue
 
                 rtype = record.get("type")
-                if rtype not in ("assistant", "user"):
-                    continue
-
                 session_id = record.get("sessionId")
                 if not session_id:
+                    continue
+
+                if rtype in ("custom-title", "ai-title"):
+                    custom, ai = titles.get(session_id, (None, None))
+                    if rtype == "custom-title":
+                        custom = _clean_title(record.get("customTitle")) or custom
+                    else:
+                        ai = _clean_title(record.get("aiTitle")) or ai
+                    titles[session_id] = (custom, ai)
+                    continue
+
+                if rtype not in ("assistant", "user"):
                     continue
 
                 timestamp = record.get("timestamp", "")
@@ -140,69 +389,54 @@ def parse_jsonl_file(filepath):
 
                 # Update session metadata from any record
                 if session_id not in session_meta:
-                    session_meta[session_id] = {
-                        "session_id": session_id,
-                        "project_name": project_name_from_cwd(cwd),
-                        "first_timestamp": timestamp,
-                        "last_timestamp": timestamp,
-                        "git_branch": git_branch,
-                        "model": None,
-                    }
+                    session_meta[session_id] = _new_meta(
+                        session_id, project_name_from_cwd(cwd), timestamp, git_branch)
                 else:
-                    meta = session_meta[session_id]
-                    if timestamp and (not meta["first_timestamp"] or timestamp < meta["first_timestamp"]):
-                        meta["first_timestamp"] = timestamp
-                    if timestamp and (not meta["last_timestamp"] or timestamp > meta["last_timestamp"]):
-                        meta["last_timestamp"] = timestamp
-                    if git_branch and not meta["git_branch"]:
-                        meta["git_branch"] = git_branch
+                    _touch_meta(session_meta[session_id], timestamp, git_branch)
+                meta = session_meta[session_id]
 
-                if rtype == "assistant":
-                    msg = record.get("message", {})
-                    usage = msg.get("usage", {})
-                    model = msg.get("model", "")
-                    message_id = msg.get("id", "")
+                if rtype == "user":
+                    if not meta["fallback_title"] and not record.get("isSidechain"):
+                        meta["fallback_title"] = _clean_title(_first_prompt_text(record))
+                    continue
 
-                    input_tokens = usage.get("input_tokens", 0) or 0
-                    output_tokens = usage.get("output_tokens", 0) or 0
-                    cache_read = usage.get("cache_read_input_tokens", 0) or 0
-                    cache_creation = usage.get("cache_creation_input_tokens", 0) or 0
+                msg = record.get("message", {})
+                model = msg.get("model", "")
+                message_id = msg.get("id", "")
 
-                    # Only record turns that have actual token usage
-                    if input_tokens + output_tokens + cache_read + cache_creation == 0:
-                        continue
+                # Extract tool name from content if present
+                tool_name = None
+                for item in msg.get("content", []):
+                    if isinstance(item, dict) and item.get("type") == "tool_use":
+                        tool_name = item.get("name")
+                        break
 
-                    # Extract tool name from content if present
-                    tool_name = None
-                    for item in msg.get("content", []):
-                        if isinstance(item, dict) and item.get("type") == "tool_use":
-                            tool_name = item.get("name")
-                            break
+                # Only record turns that have actual token usage
+                turn = _make_turn(session_id, timestamp, model, msg.get("usage", {}),
+                                  tool_name, cwd, message_id)
+                if turn is None:
+                    continue
 
-                    if model:
-                        session_meta[session_id]["model"] = model
+                if model:
+                    meta["model"] = model
 
-                    turn = {
-                        "session_id": session_id,
-                        "timestamp": timestamp,
-                        "model": model,
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens,
-                        "cache_read_tokens": cache_read,
-                        "cache_creation_tokens": cache_creation,
-                        "tool_name": tool_name,
-                        "cwd": cwd,
-                        "message_id": message_id,
-                    }
-
-                    # Dedup: last record per message_id wins (final usage tallies)
-                    if message_id:
-                        seen_messages[message_id] = turn
-                    else:
-                        turns_no_id.append(turn)
+                if message_id:
+                    seen_messages[message_id] = turn
+                else:
+                    turns_no_id.append(turn)
 
     except Exception as e:
         print(f"  Warning: error reading {filepath}: {e}")
+
+    for sid, (custom, ai) in titles.items():
+        if sid in session_meta:
+            session_meta[sid]["custom_title"] = custom
+            if ai:
+                session_meta[sid]["fallback_title"] = ai
+        elif custom:
+            # Title record in lines appended after the session's turns were scanned
+            session_meta[sid] = {"session_id": sid, "custom_title": custom,
+                                 "fallback_title": ai, "title_only": True}
 
     turns = turns_no_id + list(seen_messages.values())
     return list(session_meta.values()), turns, line_count
@@ -251,14 +485,7 @@ def parse_cowork_audit_file(filepath):
                     if cwd:
                         session_cwds[session_id] = cwd
                     if session_id not in session_meta:
-                        session_meta[session_id] = {
-                            "session_id": session_id,
-                            "project_name": "cowork",
-                            "first_timestamp": timestamp,
-                            "last_timestamp": timestamp,
-                            "git_branch": "",
-                            "model": model,
-                        }
+                        session_meta[session_id] = _new_meta(session_id, "cowork", timestamp, "", model)
                     continue
 
                 # Only track sessions from assistant messages (not user).
@@ -269,56 +496,26 @@ def parse_cowork_audit_file(filepath):
                     continue
 
                 if session_id not in session_meta:
-                    session_meta[session_id] = {
-                        "session_id": session_id,
-                        "project_name": "cowork",
-                        "first_timestamp": timestamp,
-                        "last_timestamp": timestamp,
-                        "git_branch": "",
-                        "model": session_models.get(session_id),
-                    }
+                    session_meta[session_id] = _new_meta(
+                        session_id, "cowork", timestamp, "", session_models.get(session_id))
                 else:
-                    meta = session_meta[session_id]
-                    if timestamp and (not meta["first_timestamp"] or timestamp < meta["first_timestamp"]):
-                        meta["first_timestamp"] = timestamp
-                    if timestamp and (not meta["last_timestamp"] or timestamp > meta["last_timestamp"]):
-                        meta["last_timestamp"] = timestamp
+                    _touch_meta(session_meta[session_id], timestamp)
 
-                if rtype == "assistant":
-                    msg = record.get("message", {})
-                    usage = msg.get("usage", {})
-                    uuid = record.get("uuid", "")
-                    model = session_models.get(session_id, "")
-                    cwd = session_cwds.get(session_id, "")
+                msg = record.get("message", {})
+                uuid = record.get("uuid", "")
+                model = session_models.get(session_id, "")
+                turn = _make_turn(session_id, timestamp, model, msg.get("usage", {}),
+                                  None, session_cwds.get(session_id, ""), uuid)
+                if turn is None:
+                    continue
 
-                    input_tokens = usage.get("input_tokens", 0) or 0
-                    output_tokens = usage.get("output_tokens", 0) or 0
-                    cache_read = usage.get("cache_read_input_tokens", 0) or 0
-                    cache_creation = usage.get("cache_creation_input_tokens", 0) or 0
+                if model:
+                    session_meta[session_id]["model"] = model
 
-                    if input_tokens + output_tokens + cache_read + cache_creation == 0:
-                        continue
-
-                    if model:
-                        session_meta[session_id]["model"] = model
-
-                    turn = {
-                        "session_id": session_id,
-                        "timestamp": timestamp,
-                        "model": model,
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens,
-                        "cache_read_tokens": cache_read,
-                        "cache_creation_tokens": cache_creation,
-                        "tool_name": None,
-                        "cwd": cwd,
-                        "message_id": uuid,
-                    }
-
-                    if uuid:
-                        seen_messages[uuid] = turn
-                    else:
-                        turns_no_id.append(turn)
+                if uuid:
+                    seen_messages[uuid] = turn
+                else:
+                    turns_no_id.append(turn)
 
     except Exception as e:
         print(f"  Warning: error reading {filepath}: {e}")
@@ -336,6 +533,8 @@ def aggregate_sessions(session_metas, turns):
         "total_output_tokens": 0,
         "total_cache_read": 0,
         "total_cache_creation": 0,
+        "total_cache_creation_1h": 0,
+        "total_cost": 0.0,
         "turn_count": 0,
         "model": None,
     })
@@ -347,6 +546,8 @@ def aggregate_sessions(session_metas, turns):
         s["total_output_tokens"] += t["output_tokens"]
         s["total_cache_read"] += t["cache_read_tokens"]
         s["total_cache_creation"] += t["cache_creation_tokens"]
+        s["total_cache_creation_1h"] += t.get("cache_creation_1h_tokens", 0)
+        s["total_cost"] += t.get("cost_usd", 0.0)
         s["turn_count"] += 1
         if t["model"]:
             session_model_counts[t["session_id"]][t["model"]] += 1
@@ -358,6 +559,8 @@ def aggregate_sessions(session_metas, turns):
     # Merge into session_metas
     result = []
     for meta in session_metas:
+        if meta.get("title_only"):
+            continue
         sid = meta["session_id"]
         stats = session_stats[sid]
         result.append({**meta, **stats})
@@ -368,9 +571,7 @@ def upsert_sessions(conn, sessions):
     for s in sessions:
         # Check if session exists
         existing = conn.execute(
-            "SELECT total_input_tokens, total_output_tokens, total_cache_read, "
-            "total_cache_creation, turn_count FROM sessions WHERE session_id = ?",
-            (s["session_id"],)
+            "SELECT model FROM sessions WHERE session_id = ?", (s["session_id"],)
         ).fetchone()
 
         if existing is None:
@@ -378,22 +579,21 @@ def upsert_sessions(conn, sessions):
                 INSERT INTO sessions
                     (session_id, project_name, first_timestamp, last_timestamp,
                      git_branch, total_input_tokens, total_output_tokens,
-                     total_cache_read, total_cache_creation, model, turn_count)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     total_cache_read, total_cache_creation, total_cache_creation_1h,
+                     total_cost, model, turn_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 s["session_id"], s["project_name"], s["first_timestamp"],
                 s["last_timestamp"], s["git_branch"],
                 s["total_input_tokens"], s["total_output_tokens"],
                 s["total_cache_read"], s["total_cache_creation"],
+                s.get("total_cache_creation_1h", 0), s.get("total_cost", 0.0),
                 s["model"], s["turn_count"]
             ))
         else:
             # Update: add new tokens on top of existing (since we only insert new turns)
             # Keep the highest-priority model (e.g. opus over haiku from subagents)
-            existing_model = conn.execute(
-                "SELECT model FROM sessions WHERE session_id = ?",
-                (s["session_id"],)
-            ).fetchone()["model"]
+            existing_model = existing[0]
             new_model = s["model"]
             if _model_priority(new_model) > _model_priority(existing_model):
                 model_to_set = new_model
@@ -407,6 +607,8 @@ def upsert_sessions(conn, sessions):
                     total_output_tokens = total_output_tokens + ?,
                     total_cache_read = total_cache_read + ?,
                     total_cache_creation = total_cache_creation + ?,
+                    total_cache_creation_1h = total_cache_creation_1h + ?,
+                    total_cost = total_cost + ?,
                     turn_count = turn_count + ?,
                     model = ?
                 WHERE session_id = ?
@@ -414,29 +616,66 @@ def upsert_sessions(conn, sessions):
                 s["last_timestamp"],
                 s["total_input_tokens"], s["total_output_tokens"],
                 s["total_cache_read"], s["total_cache_creation"],
+                s.get("total_cache_creation_1h", 0), s.get("total_cost", 0.0),
                 s["turn_count"], model_to_set,
                 s["session_id"]
             ))
+    _update_titles(conn, sessions)
 
 
 def insert_turns(conn, turns):
-    conn.executemany("""
-        INSERT OR IGNORE INTO turns
+    """Insert turns; a message already stored keeps the larger token tallies,
+    so a scan that caught a response mid-stream is corrected on the next one."""
+    rows = []
+    for t in turns:
+        t = {"cache_creation_1h_tokens": 0, "speed": None, "web_search_requests": 0, **t}
+        if "cost_usd" not in t:
+            t["cost_usd"] = turn_cost(t)
+        rows.append((
+            t["session_id"], t["timestamp"], t["model"],
+            t["input_tokens"], t["output_tokens"],
+            t["cache_read_tokens"], t["cache_creation_tokens"],
+            t["cache_creation_1h_tokens"], t["speed"], t["web_search_requests"],
+            t["cost_usd"], t["tool_name"], t["cwd"], t.get("message_id", ""),
+        ))
+    grow = ", ".join(f"{c} = MAX({c}, excluded.{c})" for c in _TALLY_COLUMNS)
+    conn.executemany(f"""
+        INSERT INTO turns
             (session_id, timestamp, model, input_tokens, output_tokens,
-             cache_read_tokens, cache_creation_tokens, tool_name, cwd, message_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, [
-        (t["session_id"], t["timestamp"], t["model"],
-         t["input_tokens"], t["output_tokens"],
-         t["cache_read_tokens"], t["cache_creation_tokens"],
-         t["tool_name"], t["cwd"], t.get("message_id", ""))
-        for t in turns
-    ])
+             cache_read_tokens, cache_creation_tokens, cache_creation_1h_tokens,
+             speed, web_search_requests, cost_usd, tool_name, cwd, message_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(message_id) WHERE message_id IS NOT NULL AND message_id != ''
+        DO UPDATE SET {grow}, speed = COALESCE(excluded.speed, speed)
+    """, rows)
+    # Re-price rows whose tallies were just merged into an existing message
+    conn.executemany(f"UPDATE turns SET cost_usd = {PRICE_SQL} WHERE message_id = ? AND message_id != ''",
+                     [(r[-1],) for r in rows if r[-1]])
 
 
-def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
+def _scan_file(conn, filepath, skip_lines, parser):
+    """Parse (part of) one file and store it. Returns (line_count, turns, session_ids)."""
+    if parser is parse_jsonl_file:
+        session_metas, turns, line_count = parser(filepath, skip_lines=skip_lines)
+    else:
+        session_metas, turns, line_count = parser(filepath)
+    sessions = aggregate_sessions(session_metas, turns)
+    if sessions:
+        upsert_sessions(conn, sessions)
+    _update_titles(conn, [m for m in session_metas if m.get("title_only")])
+    if turns:
+        insert_turns(conn, turns)
+    return line_count, len(turns), {s["session_id"] for s in sessions}
+
+
+def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True, full=False):
+    """Scan transcripts into the DB. `full=True` re-reads every file (a
+    non-destructive rebuild: stored history from deleted transcripts is kept)."""
     conn = get_db(db_path)
     init_db(conn)
+    if full:
+        conn.execute("DELETE FROM processed_files")
+        conn.commit()
 
     if projects_dirs:
         dirs_to_scan = [Path(d) for d in projects_dirs]
@@ -454,13 +693,23 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
         jsonl_files.extend(glob.glob(str(d / "**" / "*.jsonl"), recursive=True))
     jsonl_files.sort()
 
+    cowork_audit_files = []
+    if COWORK_SESSIONS_DIR.exists():
+        if verbose:
+            print(f"Scanning {COWORK_SESSIONS_DIR} (Cowork) ...")
+        cowork_audit_files = sorted(glob.glob(
+            str(COWORK_SESSIONS_DIR / "**" / "audit.jsonl"), recursive=True
+        ))
+
     new_files = 0
     updated_files = 0
     skipped_files = 0
     total_turns = 0
     total_sessions = set()
 
-    for filepath in jsonl_files:
+    work = [(p, parse_jsonl_file) for p in jsonl_files] + \
+           [(p, parse_cowork_audit_file) for p in cowork_audit_files]
+    for filepath, parser in work:
         try:
             mtime = os.path.getmtime(filepath)
         except OSError:
@@ -480,126 +729,25 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
             status = "NEW" if is_new else "UPD"
             print(f"  [{status}] {filepath}")
 
+        # Claude Code files only grow, so only new lines are read. Cowork files
+        # are always fully parsed (model is in the line-1 init record; message
+        # uuid dedup prevents double-counting).
+        old_lines = row["lines"] if row else 0
+        line_count, n_turns, sids = _scan_file(conn, filepath, old_lines, parser)
+
+        if not is_new and parser is parse_jsonl_file and line_count <= old_lines:
+            # File didn't grow (mtime changed but no new content)
+            conn.execute("UPDATE processed_files SET mtime = ? WHERE path = ?",
+                         (mtime, filepath))
+            conn.commit()
+            skipped_files += 1
+            continue
+
+        total_turns += n_turns
+        total_sessions |= sids
         if is_new:
-            # New file: full parse (single read, returns line count)
-            session_metas, turns, line_count = parse_jsonl_file(filepath)
-
-            if turns or session_metas:
-                sessions = aggregate_sessions(session_metas, turns)
-                upsert_sessions(conn, sessions)
-                insert_turns(conn, turns)
-                for s in sessions:
-                    total_sessions.add(s["session_id"])
-                total_turns += len(turns)
-                new_files += 1
-
+            new_files += 1
         else:
-            # Updated file: read once, process only new lines
-            old_lines = row["lines"] if row else 0
-            seen_messages = {}  # message_id -> turn (dedup streaming)
-            turns_no_id = []
-            new_session_metas = {}
-            line_count = 0
-
-            try:
-                with open(filepath, encoding="utf-8", errors="replace") as f:
-                    for line_count, line in enumerate(f, 1):
-                        if line_count <= old_lines:
-                            continue
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            record = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-
-                        rtype = record.get("type")
-                        if rtype not in ("assistant", "user"):
-                            continue
-
-                        session_id = record.get("sessionId")
-                        if not session_id:
-                            continue
-
-                        timestamp = record.get("timestamp", "")
-                        cwd = record.get("cwd", "")
-
-                        # Track session metadata from new lines
-                        if session_id not in new_session_metas:
-                            new_session_metas[session_id] = {
-                                "session_id": session_id,
-                                "project_name": project_name_from_cwd(cwd),
-                                "first_timestamp": timestamp,
-                                "last_timestamp": timestamp,
-                                "git_branch": record.get("gitBranch", ""),
-                                "model": None,
-                            }
-                        else:
-                            meta = new_session_metas[session_id]
-                            if timestamp and (not meta["last_timestamp"] or timestamp > meta["last_timestamp"]):
-                                meta["last_timestamp"] = timestamp
-
-                        if rtype == "assistant":
-                            msg = record.get("message", {})
-                            usage = msg.get("usage", {})
-                            model = msg.get("model", "")
-                            message_id = msg.get("id", "")
-
-                            input_tokens = usage.get("input_tokens", 0) or 0
-                            output_tokens = usage.get("output_tokens", 0) or 0
-                            cache_read = usage.get("cache_read_input_tokens", 0) or 0
-                            cache_creation = usage.get("cache_creation_input_tokens", 0) or 0
-
-                            if input_tokens + output_tokens + cache_read + cache_creation == 0:
-                                continue
-
-                            tool_name = None
-                            for item in msg.get("content", []):
-                                if isinstance(item, dict) and item.get("type") == "tool_use":
-                                    tool_name = item.get("name")
-                                    break
-
-                            if model:
-                                new_session_metas[session_id]["model"] = model
-
-                            turn = {
-                                "session_id": session_id,
-                                "timestamp": timestamp,
-                                "model": model,
-                                "input_tokens": input_tokens,
-                                "output_tokens": output_tokens,
-                                "cache_read_tokens": cache_read,
-                                "cache_creation_tokens": cache_creation,
-                                "tool_name": tool_name,
-                                "cwd": cwd,
-                                "message_id": message_id,
-                            }
-
-                            if message_id:
-                                seen_messages[message_id] = turn
-                            else:
-                                turns_no_id.append(turn)
-            except Exception as e:
-                print(f"  Warning: {e}")
-
-            if line_count <= old_lines:
-                # File didn't grow (mtime changed but no new content)
-                conn.execute("UPDATE processed_files SET mtime = ? WHERE path = ?",
-                             (mtime, filepath))
-                conn.commit()
-                skipped_files += 1
-                continue
-
-            new_turns = turns_no_id + list(seen_messages.values())
-
-            if new_turns or new_session_metas:
-                sessions = aggregate_sessions(list(new_session_metas.values()), new_turns)
-                upsert_sessions(conn, sessions)
-                insert_turns(conn, new_turns)
-                for s in sessions:
-                    total_sessions.add(s["session_id"])
-                total_turns += len(new_turns)
             updated_files += 1
 
         # Record file as processed (line_count already known from the single read)
@@ -609,71 +757,11 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
         """, (filepath, mtime, line_count))
         conn.commit()
 
-    # Scan Cowork audit files
-    cowork_audit_files = []
-    if COWORK_SESSIONS_DIR.exists():
-        if verbose:
-            print(f"Scanning {COWORK_SESSIONS_DIR} (Cowork) ...")
-        cowork_audit_files = glob.glob(
-            str(COWORK_SESSIONS_DIR / "**" / "audit.jsonl"), recursive=True
-        )
-        cowork_audit_files.sort()
-
-    for filepath in cowork_audit_files:
-        try:
-            mtime = os.path.getmtime(filepath)
-        except OSError:
-            continue
-
-        row = conn.execute(
-            "SELECT mtime, lines FROM processed_files WHERE path = ?",
-            (filepath,)
-        ).fetchone()
-
-        if row and abs(row["mtime"] - mtime) < 0.01:
-            skipped_files += 1
-            continue
-
-        is_new = row is None
-        if verbose:
-            status = "NEW" if is_new else "UPD"
-            print(f"  [{status}] {filepath}")
-
-        # Always full-parse Cowork files (model is in line 1 system init,
-        # so we can't skip old lines; uuid dedup prevents double-counting)
-        session_metas, turns, line_count = parse_cowork_audit_file(filepath)
-
-        if turns or session_metas:
-            sessions = aggregate_sessions(session_metas, turns)
-            upsert_sessions(conn, sessions)
-            insert_turns(conn, turns)
-            for s in sessions:
-                total_sessions.add(s["session_id"])
-            total_turns += len(turns)
-
-        if is_new:
-            new_files += 1
-        else:
-            updated_files += 1
-
-        conn.execute("""
-            INSERT OR REPLACE INTO processed_files (path, mtime, lines)
-            VALUES (?, ?, ?)
-        """, (filepath, mtime, line_count))
-        conn.commit()
-
     # Recompute session totals from actual turns in DB.
-    # This ensures correctness when INSERT OR IGNORE skips duplicate turns
-    # but upsert_sessions had already added their tokens additively.
+    # This ensures correctness when a duplicate turn was merged into an
+    # existing row but upsert_sessions had already added its tokens additively.
     if new_files or updated_files:
-        conn.execute("""
-            UPDATE sessions SET
-                total_input_tokens = COALESCE((SELECT SUM(input_tokens) FROM turns WHERE turns.session_id = sessions.session_id), 0),
-                total_output_tokens = COALESCE((SELECT SUM(output_tokens) FROM turns WHERE turns.session_id = sessions.session_id), 0),
-                total_cache_read = COALESCE((SELECT SUM(cache_read_tokens) FROM turns WHERE turns.session_id = sessions.session_id), 0),
-                total_cache_creation = COALESCE((SELECT SUM(cache_creation_tokens) FROM turns WHERE turns.session_id = sessions.session_id), 0),
-                turn_count = COALESCE((SELECT COUNT(*) FROM turns WHERE turns.session_id = sessions.session_id), 0)
-        """)
+        _recompute_session_totals(conn)
         conn.commit()
 
     if verbose:
@@ -696,4 +784,4 @@ if __name__ == "__main__":
         if arg == "--projects-dir" and i + 1 < len(sys.argv[1:]):
             projects_dir = Path(sys.argv[i + 2])
             break
-    scan(projects_dir=projects_dir)
+    scan(projects_dir=projects_dir, full="--full" in sys.argv)

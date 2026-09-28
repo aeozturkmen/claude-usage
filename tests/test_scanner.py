@@ -7,10 +7,24 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import scanner
+from pricing import calc_cost
 from scanner import (
     get_db, init_db, project_name_from_cwd, parse_jsonl_file,
     aggregate_sessions, upsert_sessions, insert_turns, scan,
 )
+
+_real_cowork_dir = scanner.COWORK_SESSIONS_DIR
+
+
+def setUpModule():
+    # scan() also reads the Claude desktop app's Cowork dir; keep the
+    # developer's real sessions out of these tests.
+    scanner.COWORK_SESSIONS_DIR = Path(tempfile.mkdtemp()) / "no-cowork"
+
+
+def tearDownModule():
+    scanner.COWORK_SESSIONS_DIR = _real_cowork_dir
 
 
 class TestProjectNameFromCwd(unittest.TestCase):
@@ -41,15 +55,21 @@ def _make_assistant_record(session_id="sess-1", model="claude-sonnet-4-6",
                            cache_read=10, cache_creation=5,
                            timestamp="2026-04-08T10:00:00Z",
                            cwd="/home/user/project",
-                           message_id=""):
+                           message_id="", cache_creation_1h=None):
+    usage = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_input_tokens": cache_read,
+        "cache_creation_input_tokens": cache_creation,
+    }
+    if cache_creation_1h is not None:
+        usage["cache_creation"] = {
+            "ephemeral_5m_input_tokens": cache_creation - cache_creation_1h,
+            "ephemeral_1h_input_tokens": cache_creation_1h,
+        }
     msg = {
         "model": model,
-        "usage": {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "cache_read_input_tokens": cache_read,
-            "cache_creation_input_tokens": cache_creation,
-        },
+        "usage": usage,
         "content": [],
     }
     if message_id:
@@ -643,6 +663,191 @@ class TestParseJsonlFileLineCount(unittest.TestCase):
             pass
         _, _, line_count = parse_jsonl_file(path)
         self.assertEqual(line_count, 0)
+
+
+class TestCacheTTLTracking(unittest.TestCase):
+    """1h-TTL cache writes are stored separately so they can be priced at 2x."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.projects_dir = Path(self.tmpdir) / "projects" / "user"
+        self.projects_dir.mkdir(parents=True)
+        self.db_path = Path(self.tmpdir) / "usage.db"
+        self.jsonl = self.projects_dir / "s.jsonl"
+        self.jsonl.write_text("\n".join([
+            _make_user_record(),
+            _make_assistant_record(message_id="m1", cache_creation=1000, cache_creation_1h=800),
+            _make_assistant_record(message_id="m2", cache_creation=50),
+        ]) + "\n")
+
+    def test_parse_extracts_1h_tokens(self):
+        _, turns, _ = parse_jsonl_file(self.jsonl)
+        by_id = {t["message_id"]: t for t in turns}
+        self.assertEqual(by_id["m1"]["cache_creation_1h_tokens"], 800)
+        self.assertEqual(by_id["m2"]["cache_creation_1h_tokens"], 0)
+
+    def test_scan_stores_turn_and_session_totals(self):
+        scan(projects_dir=self.projects_dir.parent, db_path=self.db_path, verbose=False)
+        conn = sqlite3.connect(self.db_path)
+        self.assertEqual(conn.execute("SELECT SUM(cache_creation_1h_tokens) FROM turns").fetchone()[0], 800)
+        self.assertEqual(conn.execute("SELECT total_cache_creation_1h FROM sessions").fetchone()[0], 800)
+        conn.close()
+
+    def test_old_schema_is_migrated_and_backfilled(self):
+        scan(projects_dir=self.projects_dir.parent, db_path=self.db_path, verbose=False)
+        conn = sqlite3.connect(self.db_path)
+        # Simulate a DB created before the 1h columns existed
+        conn.execute("ALTER TABLE turns DROP COLUMN cache_creation_1h_tokens")
+        conn.execute("ALTER TABLE sessions DROP COLUMN total_cache_creation_1h")
+        conn.execute("PRAGMA user_version = 0")
+        conn.commit()
+        conn.row_factory = sqlite3.Row
+        init_db(conn)
+        self.assertEqual(conn.execute("SELECT SUM(cache_creation_1h_tokens) FROM turns").fetchone()[0], 800)
+        self.assertEqual(conn.execute("SELECT total_cache_creation_1h FROM sessions").fetchone()[0], 800)
+        conn.close()
+
+
+def _write(path, records):
+    path.write_text("\n".join(records) + "\n")
+
+
+def _append(path, records):
+    """Append lines and bump mtime so an immediate rescan sees the change."""
+    with open(path, "a") as f:
+        f.write("\n".join(records) + "\n")
+    later = os.path.getmtime(path) + 10
+    os.utime(path, (later, later))
+
+
+class _ScanCase(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.projects_dir = Path(self.tmpdir) / "projects"
+        (self.projects_dir / "user").mkdir(parents=True)
+        self.db_path = Path(self.tmpdir) / "usage.db"
+        self.jsonl = self.projects_dir / "user" / "s.jsonl"
+
+    def scan(self, **kw):
+        return scan(projects_dir=self.projects_dir, db_path=self.db_path, verbose=False, **kw)
+
+    def query(self, sql):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            return conn.execute(sql).fetchall()
+        finally:
+            conn.close()
+
+
+class TestMidStreamTallies(_ScanCase):
+    """A scan that lands while a response is still streaming must not freeze
+    the partial token counts (upstream #169)."""
+
+    def test_final_tallies_replace_partial_ones(self):
+        _write(self.jsonl, [_make_user_record(),
+                            _make_assistant_record(message_id="m1", output_tokens=5)])
+        self.scan()
+        _append(self.jsonl, [_make_assistant_record(message_id="m1", output_tokens=900)])
+        self.scan()
+        self.assertEqual(self.query("SELECT COUNT(*), SUM(output_tokens) FROM turns")[0], (1, 900))
+        self.assertEqual(self.query("SELECT total_output_tokens FROM sessions")[0][0], 900)
+        cost = self.query("SELECT cost_usd FROM turns")[0][0]
+        self.assertAlmostEqual(cost, calc_cost("claude-sonnet-4-6", 100, 900, 10, 5))
+
+
+class TestStoredCosts(_ScanCase):
+    def _assistant(self, message_id, **usage_extra):
+        rec = json.loads(_make_assistant_record(message_id=message_id, model="claude-opus-5",
+                                                input_tokens=1_000_000, output_tokens=0,
+                                                cache_read=0, cache_creation=0))
+        rec["message"]["usage"].update(usage_extra)
+        return json.dumps(rec)
+
+    def test_fast_mode_uses_multiplier(self):
+        _write(self.jsonl, [self._assistant("m1", speed="fast"), self._assistant("m2", speed="standard")])
+        self.scan()
+        rows = dict(self.query("SELECT speed, cost_usd FROM turns"))
+        self.assertAlmostEqual(rows["standard"], 5.00)
+        self.assertAlmostEqual(rows["fast"], 10.00)
+
+    def test_web_search_requests_are_billed(self):
+        _write(self.jsonl, [self._assistant("m1", server_tool_use={"web_search_requests": 3})])
+        self.scan()
+        self.assertEqual(self.query("SELECT web_search_requests FROM turns")[0][0], 3)
+        self.assertAlmostEqual(self.query("SELECT total_cost FROM sessions")[0][0], 5.00 + 0.03)
+
+    def test_costs_recomputed_when_pricing_changes(self):
+        _write(self.jsonl, [self._assistant("m1")])
+        self.scan()
+        conn = get_db(self.db_path)
+        conn.execute("UPDATE turns SET cost_usd = 0")
+        conn.execute("UPDATE meta SET value = 'stale' WHERE key = 'pricing'")
+        conn.commit()
+        init_db(conn)
+        conn.close()
+        self.assertAlmostEqual(self.query("SELECT cost_usd FROM turns")[0][0], 5.00)
+
+
+class TestSessionTitles(_ScanCase):
+    def _title(self, kind, text, sid="sess-1"):
+        key = "customTitle" if kind == "custom-title" else "aiTitle"
+        return json.dumps({"type": kind, key: text, "sessionId": sid})
+
+    def _prompt(self, text):
+        rec = json.loads(_make_user_record())
+        rec["message"] = {"role": "user", "content": text}
+        return json.dumps(rec)
+
+    def title(self):
+        return self.query("SELECT title FROM sessions")[0][0]
+
+    def test_first_prompt_is_fallback(self):
+        _write(self.jsonl, [self._prompt("<command-name>/init</command-name>"),
+                            self._prompt("Fix the   login\nbug"),
+                            _make_assistant_record(message_id="m1")])
+        self.scan()
+        self.assertEqual(self.title(), "Fix the login bug")
+
+    def test_ai_title_beats_prompt_and_custom_beats_ai(self):
+        _write(self.jsonl, [self._prompt("hello"), _make_assistant_record(message_id="m1"),
+                            self._title("ai-title", "AI title")])
+        self.scan()
+        self.assertEqual(self.title(), "AI title")
+        _append(self.jsonl, [self._title("custom-title", "My rename")])
+        self.scan()
+        self.assertEqual(self.title(), "My rename")
+
+
+class TestWorktreeFolding(unittest.TestCase):
+    def test_claude_worktree_folds_into_repo(self):
+        self.assertEqual(
+            project_name_from_cwd("/home/me/code/app/.claude/worktrees/nifty-pike-5220d0"),
+            "code/app")
+
+    def test_git_worktree_resolved_via_git_file(self):
+        root = Path(tempfile.mkdtemp())
+        wt = root / "elsewhere" / "feature-x"
+        wt.mkdir(parents=True)
+        (wt / ".git").write_text(f"gitdir: {root}/src/myrepo/.git/worktrees/feature-x\n")
+        self.assertEqual(project_name_from_cwd(str(wt)), "src/myrepo")
+
+    def test_regular_checkout_unchanged(self):
+        self.assertEqual(project_name_from_cwd("/home/me/code/app"), "code/app")
+
+
+class TestFullRescanKeepsHistory(_ScanCase):
+    """Rescan must not drop usage whose transcript Claude Code has deleted."""
+
+    def test_deleted_transcript_turns_survive_full_rescan(self):
+        other = self.projects_dir / "user" / "old.jsonl"
+        _write(other, [_make_assistant_record(session_id="old", message_id="o1")])
+        _write(self.jsonl, [_make_assistant_record(message_id="m1")])
+        self.scan()
+        other.unlink()
+        result = self.scan(full=True)
+        self.assertEqual(result["new"], 1)
+        self.assertEqual(self.query("SELECT COUNT(*) FROM turns")[0][0], 2)
+        self.assertEqual(self.query("SELECT COUNT(*) FROM sessions")[0][0], 2)
 
 
 if __name__ == "__main__":

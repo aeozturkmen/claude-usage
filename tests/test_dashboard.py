@@ -10,6 +10,7 @@ import urllib.request
 from pathlib import Path
 
 from scanner import get_db, init_db, upsert_sessions, insert_turns
+from scanner import _recompute_session_totals as scanner_recompute
 from dashboard import get_dashboard_data, DashboardHandler, HTML_TEMPLATE
 
 try:
@@ -124,6 +125,56 @@ class TestGetDashboardData(unittest.TestCase):
         self.assertTrue(all(r["day"] == "2026-04-08" for r in rows))
 
 
+class TestPerTurnCosts(unittest.TestCase):
+    """Sessions and projects are priced per turn model, not by the session's
+    primary-model label (upstream #165/#173)."""
+
+    def setUp(self):
+        self.tmpfile = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmpfile.close()
+        self.db_path = Path(self.tmpfile.name)
+        conn = get_db(self.db_path)
+        init_db(conn)
+        upsert_sessions(conn, [{
+            "session_id": "sess-mixed", "project_name": "user/proj",
+            "first_timestamp": "2026-04-08T09:00:00Z", "last_timestamp": "2026-04-08T10:00:00Z",
+            "git_branch": "main", "model": "claude-opus-5",
+            "total_input_tokens": 0, "total_output_tokens": 0,
+            "total_cache_read": 0, "total_cache_creation": 0, "turn_count": 0,
+        }])
+        base = {"session_id": "sess-mixed", "timestamp": "2026-04-08T09:10:00Z",
+                "output_tokens": 0, "cache_read_tokens": 0, "cache_creation_tokens": 0,
+                "tool_name": None, "cwd": "/tmp"}
+        insert_turns(conn, [
+            {**base, "model": "claude-opus-5", "input_tokens": 1_000_000, "message_id": "a"},
+            {**base, "model": "claude-haiku-4-5", "input_tokens": 1_000_000, "message_id": "b"},
+            {**base, "model": "glm-5.1", "input_tokens": 1_000_000, "message_id": "c"},
+        ])
+        scanner_recompute(conn)
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        os.unlink(self.db_path)
+
+    def test_session_cost_sums_each_turns_model(self):
+        s = get_dashboard_data(db_path=self.db_path)["sessions_all"][0]
+        self.assertAlmostEqual(s["cost"], 5.00 + 1.00)  # not 3 x $5 at the Opus label
+        self.assertEqual(sorted(s["models"]), ["claude-haiku-4-5", "claude-opus-5", "glm-5.1"])
+
+    def test_project_rows_carry_per_model_cost(self):
+        rows = get_dashboard_data(db_path=self.db_path)["daily_by_project"]
+        by_model = {r["model"]: r["cost"] for r in rows}
+        self.assertAlmostEqual(by_model["claude-haiku-4-5"], 1.00)
+        self.assertAlmostEqual(by_model["glm-5.1"], 0.0)
+        self.assertEqual({r["branch"] for r in rows}, {"main"})
+
+    def test_billable_models_excludes_non_claude(self):
+        data = get_dashboard_data(db_path=self.db_path)
+        self.assertIn("claude-opus-5", data["billable_models"])
+        self.assertNotIn("glm-5.1", data["billable_models"])
+
+
 class TestDashboardHTTP(unittest.TestCase):
     """Integration test: start server and make HTTP requests."""
 
@@ -143,6 +194,7 @@ class TestDashboardHTTP(unittest.TestCase):
             (_s, "DB_PATH"):                (_s.DB_PATH,                tmp / "usage.db"),
             (_s, "PROJECTS_DIR"):           (_s.PROJECTS_DIR,           tmp_projects),
             (_s, "DEFAULT_PROJECTS_DIRS"):  (_s.DEFAULT_PROJECTS_DIRS,  [tmp_projects]),
+            (_s, "COWORK_SESSIONS_DIR"):    (_s.COWORK_SESSIONS_DIR,    tmp / "no-cowork"),
         }
         for (mod, name), (_orig, new) in cls._patches.items():
             setattr(mod, name, new)
@@ -207,15 +259,15 @@ class TestHTMLTemplate(unittest.TestCase):
     def test_template_has_chart_js(self):
         self.assertIn("chart.js", HTML_TEMPLATE.lower())
 
-    def test_template_has_substring_matching(self):
-        """Verify getPricing falls back to substring match for unknown models."""
-        self.assertIn("m.includes('opus')", HTML_TEMPLATE)
-        self.assertIn("m.includes('sonnet')", HTML_TEMPLATE)
-        self.assertIn("m.includes('haiku')", HTML_TEMPLATE)
+    def test_costs_come_from_server(self):
+        """Pricing lives in pricing.py; the page only sums server-computed costs."""
+        self.assertNotIn("calcCost(", HTML_TEMPLATE)
+        self.assertIn("billable_models", HTML_TEMPLATE)
 
-    def test_unknown_models_return_null(self):
-        """Verify getPricing returns null for non-Anthropic models."""
-        self.assertIn("return null;", HTML_TEMPLATE)
+    def test_local_date_helper(self):
+        """toISOString() shifts dates a day in UTC+ timezones; ranges use local dates."""
+        self.assertIn("function localISO(", HTML_TEMPLATE)
+        self.assertNotIn("toISOString().slice(0, 10)", HTML_TEMPLATE)
 
     def test_hourly_chart_canvas_present(self):
         """Hourly distribution chart has a canvas + TZ toggle."""
@@ -227,41 +279,6 @@ class TestHTMLTemplate(unittest.TestCase):
         """Peak-hour set covers UTC 12–17 (Mon–Fri 05:00–11:00 PT)."""
         self.assertIn('PEAK_HOURS_UTC', HTML_TEMPLATE)
         self.assertIn('[12, 13, 14, 15, 16, 17]', HTML_TEMPLATE)
-
-
-class TestPricingParity(unittest.TestCase):
-    """Verify CLI and dashboard pricing tables stay in sync."""
-
-    def _extract_js_pricing(self):
-        """Extract pricing values from the dashboard JS PRICING object."""
-        import re
-        prices = {}
-        for match in re.finditer(
-            r"'(claude-[^']+)':\s*\{\s*input:\s*([\d.]+),\s*output:\s*([\d.]+)",
-            HTML_TEMPLATE
-        ):
-            model, inp, out = match.group(1), float(match.group(2)), float(match.group(3))
-            prices[model] = {"input": inp, "output": out}
-        return prices
-
-    def test_all_cli_models_in_dashboard(self):
-        from cli import PRICING as CLI_PRICING
-        js_prices = self._extract_js_pricing()
-        for model in CLI_PRICING:
-            self.assertIn(model, js_prices, f"{model} missing from dashboard JS")
-
-    def test_prices_match(self):
-        from cli import PRICING as CLI_PRICING
-        js_prices = self._extract_js_pricing()
-        for model in CLI_PRICING:
-            self.assertAlmostEqual(
-                CLI_PRICING[model]["input"], js_prices[model]["input"],
-                msg=f"{model} input price mismatch"
-            )
-            self.assertAlmostEqual(
-                CLI_PRICING[model]["output"], js_prices[model]["output"],
-                msg=f"{model} output price mismatch"
-            )
 
 
 if __name__ == "__main__":
