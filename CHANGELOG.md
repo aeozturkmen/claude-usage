@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-11-10
+
+- Several macOS profiles can share one database and one dashboard address: `deploy/install.sh` (plus `status.sh`, `uninstall.sh`) installs the code to `/Users/Shared/ClaudeUsage/app`, migrates or merges the profile's existing DB, and starts a LaunchAgent with `cli.py dashboard --agent`
+- `--agent` mode: no browser tab; if another profile serves the port, stand by, scan this profile on request (page load, Rescan) and every 15 min, and take the port over when it frees; exit on code updates so launchd restarts the agent on the new version
+- `CLAUDE_USAGE_DB` env var and `~/.claude/usage-db-path` pointer select the database; DBs in a group-writable folder keep group-writable files and use a 30 s lock timeout
+- A full Rescan only forgets the scanned profile's files, so other profiles' rows in a shared DB stay
+- `scanner.merge_db()` merges another usage DB's sessions and turns without duplicates
+- The dashboard header lists the profiles that feed the DB
+
+## 2026-10-22
+
+- Remove the 30-second auto-refresh: an open dashboard tab no longer rescans transcripts in the background. Data is scanned on page load (incremental) and on Rescan (full)
+
 ## 2026-09-28
 
 - Add pricing for Fable 5.1 / 5, Mythos 5.1 / 5, Opus 5.5 / 5 / 4.8, Sonnet 5, and legacy Opus 4 / 4.1, Sonnet 4 / 3.7, Haiku 3.5 / 3 (Fable models were previously costed at $0)

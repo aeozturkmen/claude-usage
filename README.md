@@ -123,7 +123,7 @@ Claude Code writes one JSONL file per session to `~/.claude/projects/`. Each lin
 
 `scanner.py` parses those files and stores the data in a SQLite database at `~/.claude/usage.db`, including a USD cost per turn. Stored costs are recomputed automatically when `pricing.py` changes, and schema upgrades backfill new fields from the transcripts that still exist.
 
-`dashboard.py` serves a single-page dashboard on `localhost:8080` with Chart.js charts (loaded from CDN). It auto-refreshes every 30 seconds and supports model filtering with bookmarkable URLs. The bind address and port can be overridden with `HOST` and `PORT` environment variables (defaults: `localhost`, `8080`).
+`dashboard.py` serves a single-page dashboard on `localhost:8080` with Chart.js charts (loaded from CDN). It does not poll in the background: new usage is picked up on each page load (incremental scan) or with the Rescan button (full re-read). It supports model filtering with bookmarkable URLs. The bind address and port can be overridden with `HOST` and `PORT` environment variables (defaults: `localhost`, `8080`).
 
 ---
 
@@ -209,6 +209,20 @@ Replace `/path/to/claude-usage` and `YOUR_USERNAME` with your actual values, the
 ```bash
 launchctl load ~/Library/LaunchAgents/com.claudeusage.dashboard.plist
 ```
+
+---
+
+## macOS — Several profiles on one Mac (shared data, one address)
+
+Each macOS user account can feed one shared database and use one dashboard address. Run this once in every profile (no sudo):
+
+```bash
+bash deploy/install.sh
+```
+
+It installs the code to `/Users/Shared/ClaudeUsage/app`, uses `/Users/Shared/ClaudeUsage/usage.db` as the shared database (an existing `~/.claude/usage.db` is migrated or merged, and the original is kept under `~/.claude/claude-usage-backup/`), and starts a LaunchAgent that runs `cli.py dashboard --port 9050 --agent`. The first profile to bind the port serves http://localhost:9050. The others stand by: they scan their own transcripts when the server asks (on every page load and Rescan) and take over the port when the serving profile logs out. Agents restart on their own when the shared code changes, so every profile runs the same pricing. `deploy/status.sh` shows the state, and `deploy/uninstall.sh` removes the agent from a profile. The full guide (Turkish) is [docs/KURULUM.md](docs/KURULUM.md).
+
+`CLAUDE_USAGE_DB` (or the path in `~/.claude/usage-db-path`, written by the installer) points any command at a database other than `~/.claude/usage.db`.
 
 ---
 

@@ -2,16 +2,18 @@
 dashboard.py - Local web dashboard served on localhost (default port 8080).
 """
 
+import errno
 import json
 import os
+import threading
+import time
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from datetime import datetime
 
 from pricing import get_pricing
-from scanner import get_db, init_db
-
-DB_PATH = Path.home() / ".claude" / "usage.db"
+from scanner import get_db, init_db, is_shared_dir, make_shared
+from scanner import DB_PATH  # ~/.claude/usage.db, or $CLAUDE_USAGE_DB when profiles share one
 
 
 def get_dashboard_data(db_path=None):
@@ -51,6 +53,12 @@ def get_dashboard_data(db_path=None):
         ORDER BY SUM(input_tokens + output_tokens) DESC
     """).fetchall()
     all_models = [r["model"] for r in model_rows]
+
+    # macOS profiles whose transcripts feed this DB (/Users/<name>/...)
+    profiles = sorted({
+        Path(r[0]).parts[2] for r in conn.execute("SELECT path FROM processed_files")
+        if len(Path(r[0]).parts) > 2 and Path(r[0]).parts[1] in ("Users", "home")
+    })
 
     # ── Daily per-model, ALL history (client filters by range) ────────────────
     daily_rows = conn.execute(f"""
@@ -179,6 +187,7 @@ def get_dashboard_data(db_path=None):
         "hourly_by_model":  hourly_by_model,
         "sessions_all":     sessions_all,
         "monthly_budget":   monthly_budget,
+        "profiles":         profiles,
         "generated_at":     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -564,15 +573,6 @@ const RANGE_LABELS = { 'week': 'This Week', 'month': 'This Month', 'prev-month':
 const RANGE_TICKS  = { 'week': 7, 'month': 15, 'prev-month': 15, '7d': 7, '30d': 15, '90d': 13, 'all': 12 };
 const VALID_RANGES = Object.keys(RANGE_LABELS);
 
-function rangeIncludesToday(range) {
-  if (range === 'all') return true;
-  const { start, end } = getRangeBounds(range);
-  const today = localISO(new Date());
-  if (start && today < start) return false;
-  if (end && today > end) return false;
-  return true;
-}
-
 function getRangeBounds(range) {
   if (range === 'all') return { start: null, end: null };
   const today = new Date();
@@ -617,7 +617,6 @@ function setRange(range) {
   );
   updateURL();
   applyFilter();
-  scheduleAutoRefresh();
 }
 
 function setSource(source) {
@@ -1398,8 +1397,8 @@ async function loadData() {
       document.body.innerHTML = '<div style="padding:40px;color:#f87171">' + esc(d.error) + '</div>';
       return;
     }
-    const refreshNote = rangeIncludesToday(selectedRange) ? ' \u00b7 Auto-refresh in 30s' : '';
-    document.getElementById('meta').textContent = 'Updated: ' + d.generated_at + refreshNote;
+    document.getElementById('meta').textContent = 'Updated: ' + d.generated_at +
+      ((d.profiles || []).length > 1 ? ' \u00b7 Profiles: ' + d.profiles.join(' + ') : '');
 
     const isFirstLoad = rawData === null;
     rawData = d;
@@ -1434,26 +1433,18 @@ async function loadData() {
   }
 }
 
-let autoRefreshTimer = null;
-
-async function autoScan() {
+// No background polling: new usage is picked up only on a page load
+// (incremental scan below) or when the Rescan button is pressed.
+async function scanAndLoad() {
   try {
     await fetch('/api/autoscan', { method: 'POST' });
   } catch(e) {
-    console.error('Auto-scan failed:', e);
+    console.error('Scan on load failed:', e);
   }
   await loadData();
 }
 
-function scheduleAutoRefresh() {
-  if (autoRefreshTimer) { clearInterval(autoRefreshTimer); autoRefreshTimer = null; }
-  if (rangeIncludesToday(selectedRange)) {
-    autoRefreshTimer = setInterval(autoScan, 30000);
-  }
-}
-
-loadData();
-scheduleAutoRefresh();
+scanAndLoad();
 </script>
 </body>
 </html>
@@ -1494,12 +1485,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             # patch the module globals are honored (scan's defaults are
             # frozen at def time and would otherwise target the real paths).
             import scanner
+            peers = request_peer_scan(full=True)
             result = scanner.scan(
                 db_path=DB_PATH,
                 projects_dirs=scanner.DEFAULT_PROJECTS_DIRS,
                 verbose=False,
                 full=True,
             )
+            wait_for_peers(*peers)
             body = json.dumps(result).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -1510,11 +1503,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif self.path == "/api/autoscan":
             # Incremental scan: pick up new/modified JSONL files without wiping the DB.
             import scanner
+            peers = request_peer_scan()
             result = scanner.scan(
                 db_path=DB_PATH,
                 projects_dirs=scanner.DEFAULT_PROJECTS_DIRS,
                 verbose=False,
             )
+            wait_for_peers(*peers)
             body = json.dumps(result).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -1527,11 +1522,223 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
 
-def serve(host=None, port=None):
+# ── Several macOS profiles, one dashboard ─────────────────────────────────────
+# Each profile's LaunchAgent runs `cli.py dashboard --agent` with
+# CLAUDE_USAGE_DB pointing at one shared database. The profile that binds the
+# port first serves the page; the others stand by. Only a profile can read its
+# own transcripts, so a standby profile scans them when the server asks (on
+# every page load and Rescan) and every SCAN_INTERVAL seconds, and it takes
+# over the port when the serving profile logs out. Server and standby talk
+# through small files in <db folder>/.usage-sync/.
+
+SCAN_INTERVAL = int(os.environ.get("CLAUDE_USAGE_SCAN_INTERVAL", "") or 900)
+STANDBY_TICK = 5    # seconds between checks for a scan request
+BIND_RETRY = 30     # seconds between attempts to take over the port
+PEER_WAIT = 15      # max seconds a page load waits for standby profiles
+CODE_CHECK = 60     # seconds between checks for updated code (agent mode)
+
+_peers = {"last_request": 0.0, "slow": set()}
+
+
+def _sync_dir():
+    return Path(DB_PATH).parent / ".usage-sync"
+
+
+def _write_shared(path, text):
+    """Atomic write; the file stays writable for the other profiles."""
+    path = Path(path)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(text)
+    if is_shared_dir(path.parent):
+        make_shared(tmp)
+    os.replace(tmp, path)
+
+
+def _read_request(path):
+    """(stamp, full) from a scan.request / .done file, or (None, False)."""
+    try:
+        parts = Path(path).read_text().split()
+        return float(parts[0]), "full" in parts[1:]
+    except (OSError, ValueError, IndexError):
+        return None, False
+
+
+def _done_stamp(uid):
+    return _read_request(_sync_dir() / f"standby-{uid}.done")[0] or 0.0
+
+
+def _own_pid_file():
+    return _sync_dir() / f"standby-{os.getuid()}.pid"
+
+
+def _drop_own_pid_file():
+    pid_file = _own_pid_file()
+    try:
+        if pid_file.read_text().strip() == str(os.getpid()):
+            pid_file.unlink()
+    except OSError:
+        pass
+
+
+def _live_peers():
+    """uids of standby profiles whose process is still running."""
+    if os.name != "posix":
+        return []
+    peers = []
+    for pid_file in _sync_dir().glob("standby-*.pid"):
+        uid = pid_file.stem[len("standby-"):]
+        if uid == str(os.getuid()):
+            continue
+        try:
+            os.kill(int(pid_file.read_text().strip()), 0)
+        except PermissionError:
+            pass                    # running, owned by another profile
+        except (OSError, ValueError):
+            continue                # logged out / unreadable
+        peers.append(uid)
+    return peers
+
+
+def request_peer_scan(full=False):
+    """Ask standby profiles to scan their transcripts into the shared DB.
+    Returns (stamp, peers) for wait_for_peers()."""
+    peers = _live_peers()
+    if not peers:
+        return 0.0, []
+    # A peer that answered the previous request is waited for again.
+    _peers["slow"] = {u for u in _peers["slow"] if _done_stamp(u) < _peers["last_request"]}
+    stamp = time.time()
+    try:
+        _write_shared(_sync_dir() / "scan.request", f"{stamp!r} {'full' if full else 'incremental'}\n")
+    except OSError as e:
+        print(f"Could not ask other profiles to scan: {e}", flush=True)
+        return 0.0, []
+    _peers["last_request"] = stamp
+    return stamp, [u for u in peers if u not in _peers["slow"]]
+
+
+def wait_for_peers(stamp, peers):
+    """Block until the peers finished the scan for `stamp` (max PEER_WAIT s)."""
+    deadline = time.monotonic() + PEER_WAIT
+    pending = list(peers)
+    while pending:
+        pending = [u for u in pending if _done_stamp(u) < stamp]
+        if not pending or time.monotonic() >= deadline:
+            break
+        time.sleep(0.2)
+    # Don't hold every page load for a peer that doesn't answer (e.g. a
+    # stale pid file whose pid was reused); it rejoins once it answers.
+    _peers["slow"].update(pending)
+
+
+def _scan_own(full=False):
+    import scanner
+    try:
+        r = scanner.scan(db_path=DB_PATH, projects_dirs=scanner.DEFAULT_PROJECTS_DIRS,
+                         verbose=False, full=full)
+        if r["new"] or r["updated"]:
+            print(f"{datetime.now():%H:%M:%S} scanned this profile: "
+                  f"{r['new']} new, {r['updated']} updated files", flush=True)
+    except Exception as e:  # keep running; the next request retries
+        print(f"{datetime.now():%H:%M:%S} scan failed: {e}", flush=True)
+
+
+def _standby(host, port):
+    """Stand by while another profile serves the port. Returns the server once
+    this profile takes the port over."""
+    import signal
+
+    sync = _sync_dir()
+    sync.mkdir(parents=True, exist_ok=True)
+    if is_shared_dir(sync.parent):
+        make_shared(sync, 0o775)
+    req_file = sync / "scan.request"
+    done_file = sync / f"standby-{os.getuid()}.done"
+    _write_shared(_own_pid_file(), f"{os.getpid()}\n")
+
+    def on_term(*_):  # launchd sends SIGTERM at logout
+        _drop_own_pid_file()
+        os._exit(0)
+    try:
+        prev_handler = signal.signal(signal.SIGTERM, on_term)
+    except ValueError:  # not the main thread (tests)
+        prev_handler = None
+
+    print(f"{datetime.now():%H:%M:%S} port {port} is served by another profile; "
+          f"standing by (scan on request, every {SCAN_INTERVAL}s, port retry every {BIND_RETRY}s)",
+          flush=True)
+    seen = _read_request(req_file)[0] or 0.0  # requests from before we started are covered
+    next_scan = time.monotonic() + SCAN_INTERVAL
+    next_bind = time.monotonic() + BIND_RETRY
+    try:
+        while True:
+            time.sleep(STANDBY_TICK)
+            stamp, full = _read_request(req_file)
+            if stamp and stamp > seen:
+                seen = stamp
+                _scan_own(full=full)
+                _write_shared(done_file, f"{stamp!r}\n")
+                next_scan = time.monotonic() + SCAN_INTERVAL
+            elif time.monotonic() >= next_scan:
+                _scan_own()
+                next_scan = time.monotonic() + SCAN_INTERVAL
+            if time.monotonic() >= next_bind:
+                try:
+                    server = ThreadingHTTPServer((host, port), DashboardHandler)
+                except OSError:
+                    next_bind = time.monotonic() + BIND_RETRY
+                    continue
+                print(f"{datetime.now():%H:%M:%S} took over port {port}", flush=True)
+                return server
+    finally:
+        _drop_own_pid_file()
+        if prev_handler is not None:
+            signal.signal(signal.SIGTERM, prev_handler)
+
+
+def _watch_code():
+    """Agent mode: exit when the code changes so launchd restarts the agent on
+    the new version. Profiles sharing a DB must run the same pricing, or each
+    scan would re-price the other's turns."""
+    files = sorted(Path(__file__).resolve().parent.glob("*.py"))
+
+    def stamp():
+        out = []
+        for f in files:
+            try:
+                out.append(f.stat().st_mtime_ns)
+            except OSError:
+                out.append(None)
+        return out
+
+    start = stamp()
+
+    def loop():
+        while True:
+            time.sleep(CODE_CHECK)
+            if stamp() != start:
+                print(f"{datetime.now():%H:%M:%S} code updated; exiting so launchd "
+                      "restarts the agent", flush=True)
+                _drop_own_pid_file()
+                os._exit(0)
+
+    threading.Thread(target=loop, daemon=True).start()
+
+
+def serve(host=None, port=None, agent=False):
+    """`agent=True` (LaunchAgent): stand by instead of failing when another
+    profile already serves the port, and restart on code updates."""
     host = host or os.environ.get("HOST", "localhost")
-    port = port or int(os.environ.get("PORT", "8080"))
-    server = ThreadingHTTPServer((host, port), DashboardHandler)
-    print(f"Dashboard running at http://{host}:{port}")
+    port = int(port or os.environ.get("PORT", "8080"))
+    if agent:
+        _watch_code()
+    try:
+        server = ThreadingHTTPServer((host, port), DashboardHandler)
+    except OSError as e:
+        if not (agent and e.errno == errno.EADDRINUSE):
+            raise
+        server = _standby(host, port)
+    print(f"Dashboard running at http://{host}:{port}", flush=True)
     print("Press Ctrl+C to stop.")
     try:
         server.serve_forever()

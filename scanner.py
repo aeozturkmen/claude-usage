@@ -6,15 +6,37 @@ import json
 import os
 import glob
 import sqlite3
+import stat
 from functools import lru_cache
 from pathlib import Path
 
 from pricing import calc_cost, pricing_fingerprint
 
+
+DB_POINTER = Path.home() / ".claude" / "usage-db-path"
+
+
+def _db_path_from_env(pointer=DB_POINTER):
+    """Where the DB lives. Several macOS profiles can share one database
+    (e.g. /Users/Shared/ClaudeUsage/usage.db): $CLAUDE_USAGE_DB wins, then the
+    path in ~/.claude/usage-db-path (written by deploy/install.sh, so plain
+    terminal commands use the shared DB too), else ~/.claude/usage.db."""
+    env = os.environ.get("CLAUDE_USAGE_DB", "").strip()
+    if env:
+        return Path(env).expanduser()
+    try:
+        target = Path(pointer).read_text().strip()
+        if target:
+            return Path(target).expanduser()
+    except OSError:
+        pass
+    return Path.home() / ".claude" / "usage.db"
+
+
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 XCODE_PROJECTS_DIR = Path.home() / "Library" / "Developer" / "Xcode" / "CodingAssistant" / "ClaudeAgentConfig" / "projects"
 COWORK_SESSIONS_DIR = Path.home() / "Library" / "Application Support" / "Claude" / "local-agent-mode-sessions"
-DB_PATH = Path.home() / ".claude" / "usage.db"
+DB_PATH = _db_path_from_env()
 DEFAULT_PROJECTS_DIRS = [PROJECTS_DIR, XCODE_PROJECTS_DIR]
 
 # Bump when a data migration that re-reads the JSONL files is added to init_db()
@@ -130,11 +152,40 @@ def _register_functions(conn):
     conn.create_function("calc_cost", 8, calc_cost)
 
 
+def is_shared_dir(directory):
+    """A group-writable folder (e.g. /Users/Shared/ClaudeUsage, group staff) is
+    shared between macOS profiles, so files created in it must stay
+    group-writable too. ~/.claude (755) is not shared."""
+    if os.name != "posix":
+        return False
+    try:
+        return bool(Path(directory).stat().st_mode & stat.S_IWGRP)
+    except OSError:
+        return False
+
+
+def make_shared(path, mode=0o664):
+    """chmod a file (664) or folder (775) this profile owns so the other
+    profiles can write it; another profile's file is left alone."""
+    try:
+        if os.stat(path).st_uid == os.getuid():
+            os.chmod(path, mode)
+    except OSError:
+        pass
+
+
 def get_db(db_path=DB_PATH):
     # Ensure the parent directory exists — on a fresh install or CI runner
     # ~/.claude may not yet exist, and sqlite3.connect needs the parent dir.
-    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
+    db_path = Path(db_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    shared = is_shared_dir(db_path.parent)
+    if shared:
+        os.umask(0o002)  # keep new files (DB, journals) writable by the other profile
+    # In a shared DB another profile's scan may hold the write lock briefly.
+    conn = sqlite3.connect(str(db_path), timeout=30)
+    if shared:
+        make_shared(db_path)
     conn.row_factory = sqlite3.Row
     _register_functions(conn)
     return conn
@@ -279,6 +330,33 @@ def _recompute_session_totals(conn):
             total_cost = COALESCE((SELECT SUM(cost_usd) FROM turns WHERE turns.session_id = sessions.session_id), 0),
             turn_count = COALESCE((SELECT COUNT(*) FROM turns WHERE turns.session_id = sessions.session_id), 0)
     """)
+
+
+def merge_db(src_path, dst_path=DB_PATH):
+    """Copy the sessions and turns of another usage DB (e.g. a profile's old
+    ~/.claude/usage.db) into dst, e.g. the shared DB. Turns already present
+    (same message id) are skipped, so merging twice is harmless.
+    processed_files is not copied: the profile's next scan re-reads its
+    transcripts and the upserts keep the larger counts. Returns turns added."""
+    src = get_db(src_path)
+    init_db(src)  # bring an older DB to the current schema first
+    src.close()
+    dst = get_db(dst_path)
+    init_db(dst)
+    before = dst.execute("SELECT COUNT(*) FROM turns").fetchone()[0]
+    dst.execute("ATTACH DATABASE ? AS src", (str(src_path),))
+    for table in ("sessions", "turns"):
+        mine = [r[1] for r in dst.execute(f"PRAGMA main.table_info({table})") if r[1] != "id"]
+        theirs = {r[1] for r in dst.execute(f"PRAGMA src.table_info({table})")}
+        cols = ", ".join(c for c in mine if c in theirs)
+        dst.execute(f"INSERT OR IGNORE INTO main.{table} ({cols}) SELECT {cols} FROM src.{table}")
+    dst.commit()
+    dst.execute("DETACH DATABASE src")
+    recompute_costs(dst)
+    dst.commit()
+    added = dst.execute("SELECT COUNT(*) FROM turns").fetchone()[0] - before
+    dst.close()
+    return added
 
 
 @lru_cache(maxsize=None)
@@ -673,9 +751,6 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True, f
     non-destructive rebuild: stored history from deleted transcripts is kept)."""
     conn = get_db(db_path)
     init_db(conn)
-    if full:
-        conn.execute("DELETE FROM processed_files")
-        conn.commit()
 
     if projects_dirs:
         dirs_to_scan = [Path(d) for d in projects_dirs]
@@ -683,6 +758,16 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True, f
         dirs_to_scan = [Path(projects_dir)]
     else:
         dirs_to_scan = DEFAULT_PROJECTS_DIRS
+
+    if full:
+        # Forget only the files this scan covers. In a DB shared by several
+        # macOS profiles the other profiles' rows stay, so their next scan
+        # doesn't have to re-read everything.
+        for root in list(dirs_to_scan) + [COWORK_SESSIONS_DIR]:
+            prefix = str(root).rstrip("/\\") + os.sep
+            conn.execute("DELETE FROM processed_files WHERE substr(path, 1, ?) = ?",
+                         (len(prefix), prefix))
+        conn.commit()
 
     jsonl_files = []
     for d in dirs_to_scan:
